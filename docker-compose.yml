@@ -1,0 +1,75 @@
+# Full local stack: MongoDB + Redis + backend API + Next.js frontend.
+#
+#   cp env.example .env && cp backend/env.example backend/.env
+#   docker compose up --build
+#
+# Frontend -> http://localhost:3000   API -> http://localhost:3001/health
+#
+# This mirrors the Azure topology: the frontend proxies /api to the backend over
+# an internal hostname, so browser cookies stay same-origin.
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - salon_crm_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - salon_crm_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      MONGODB_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379
+      CORS_ORIGIN: http://localhost:3000
+    ports:
+      - "3001:3001"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      args:
+        # rewrites() is resolved during `next build`, so this is a build arg.
+        API_PROXY_TARGET: http://backend:3001
+        NEXT_PUBLIC_API_URL: /api
+        NEXT_PUBLIC_ENVIRONMENT: development
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  salon_crm_mongo_data:
+  salon_crm_redis_data:

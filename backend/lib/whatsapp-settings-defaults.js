@@ -1,0 +1,169 @@
+/**
+ * Admin UI (and some legacy saves) stored receiptNotifications / appointmentNotifications /
+ * systemAlerts as bare booleans. Business schema expects nested { enabled, ... }.
+ */
+function normalizeWhatsappNestedSection(raw, defaultsSection) {
+  if (raw === true || raw === false) {
+    return { ...defaultsSection, enabled: raw };
+  }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return {
+      ...defaultsSection,
+      ...raw,
+      enabled: Object.prototype.hasOwnProperty.call(raw, 'enabled')
+        ? raw.enabled
+        : defaultsSection.enabled
+    };
+  }
+  return { ...defaultsSection };
+}
+
+const { buildTemplateNotificationsFromSettings } = require('./whatsapp-template-notification-sync');
+
+/**
+ * Merge Business.settings.whatsappNotificationSettings with defaults (same rules as GET email-notifications).
+ * @param {object} [whatsappSettings]
+ * @param {{ publishedSlotKeys?: string[] }} [options]
+ */
+function getWhatsAppSettingsWithDefaults(whatsappSettings, options = {}) {
+  const defaults = {
+    enabled: false,
+    receiptNotifications: {
+      enabled: true,
+      autoSendToClients: true,
+      highValueThreshold: 0,
+      includeFeedbackLink: false,
+    },
+    appointmentNotifications: {
+      enabled: false,
+      newAppointments: false,
+      confirmations: false,
+      reminders: false,
+      /** Default on when appointment notifications are used; explicit false in DB still disables. */
+      reschedule: true,
+      cancellations: false
+    },
+    systemAlerts: {
+      enabled: false,
+      lowInventory: false,
+      paymentFailures: false
+    },
+    clientWalletTransactionNotifications: {
+      enabled: true
+    },
+    clientWalletExpiryReminderNotifications: {
+      enabled: true
+    },
+    clientDuesReminderNotifications: {
+      enabled: true
+    },
+    clientBirthdayReminderNotifications: {
+      enabled: true
+    }
+  };
+
+  if (!whatsappSettings || typeof whatsappSettings !== 'object' || Array.isArray(whatsappSettings)) {
+    return defaults;
+  }
+
+  const receiptNotifications = normalizeWhatsappNestedSection(
+    whatsappSettings.receiptNotifications,
+    defaults.receiptNotifications
+  );
+  const appointmentNotifications = normalizeWhatsappNestedSection(
+    whatsappSettings.appointmentNotifications,
+    defaults.appointmentNotifications
+  );
+  const systemAlerts = normalizeWhatsappNestedSection(
+    whatsappSettings.systemAlerts,
+    defaults.systemAlerts
+  );
+  const clientWalletTransactionNotifications = normalizeWhatsappNestedSection(
+    whatsappSettings.clientWalletTransactionNotifications,
+    defaults.clientWalletTransactionNotifications
+  );
+  const clientWalletExpiryReminderNotifications = normalizeWhatsappNestedSection(
+    whatsappSettings.clientWalletExpiryReminderNotifications,
+    defaults.clientWalletExpiryReminderNotifications
+  );
+  const clientDuesReminderNotifications = normalizeWhatsappNestedSection(
+    whatsappSettings.clientDuesReminderNotifications,
+    defaults.clientDuesReminderNotifications
+  );
+  const clientBirthdayReminderNotifications = normalizeWhatsappNestedSection(
+    whatsappSettings.clientBirthdayReminderNotifications,
+    defaults.clientBirthdayReminderNotifications
+  );
+
+  const merged = {
+    ...defaults,
+    ...whatsappSettings,
+    enabled: whatsappSettings.hasOwnProperty('enabled') ? whatsappSettings.enabled : defaults.enabled,
+    receiptNotifications,
+    appointmentNotifications,
+    systemAlerts,
+    clientWalletTransactionNotifications,
+    clientWalletExpiryReminderNotifications,
+    clientDuesReminderNotifications,
+    clientBirthdayReminderNotifications
+  };
+
+  if (merged.enabled === true) {
+    const rawAppt = whatsappSettings.appointmentNotifications;
+    const emptyApptObj =
+      rawAppt &&
+      typeof rawAppt === 'object' &&
+      !Array.isArray(rawAppt) &&
+      Object.keys(rawAppt).length === 0;
+
+    if (rawAppt === undefined || emptyApptObj) {
+      merged.appointmentNotifications = {
+        ...merged.appointmentNotifications,
+        enabled: true,
+        confirmations: true,
+        newAppointments: true,
+        reminders: true,
+        reschedule: true,
+        cancellations: true
+      };
+    } else if (rawAppt && typeof rawAppt === 'object') {
+      const hasEnabledKey = Object.prototype.hasOwnProperty.call(rawAppt, 'enabled');
+      if (!hasEnabledKey && (rawAppt.confirmations === true || rawAppt.newAppointments === true)) {
+        merged.appointmentNotifications = {
+          ...merged.appointmentNotifications,
+          enabled: true
+        };
+      }
+    }
+  }
+
+  // If appointment notifications are enabled but `reschedule` was never stored, prefer on (matches empty-object defaults).
+  const apptRaw = whatsappSettings && whatsappSettings.appointmentNotifications;
+  if (
+    merged.enabled &&
+    merged.appointmentNotifications &&
+    merged.appointmentNotifications.enabled &&
+    apptRaw &&
+    typeof apptRaw === 'object' &&
+    !Object.prototype.hasOwnProperty.call(apptRaw, 'reschedule')
+  ) {
+    merged.appointmentNotifications = {
+      ...merged.appointmentNotifications,
+      reschedule: true
+    };
+  }
+
+  const publishedSlotKeys = Array.isArray(options.publishedSlotKeys) ? options.publishedSlotKeys : [];
+  if (publishedSlotKeys.length) {
+    merged.templateNotifications = buildTemplateNotificationsFromSettings(merged, publishedSlotKeys);
+  } else if (merged.templateNotifications && typeof merged.templateNotifications === 'object') {
+    merged.templateNotifications = { ...merged.templateNotifications };
+  }
+
+  return merged;
+}
+
+module.exports = {
+  normalizeWhatsappNestedSection,
+  getWhatsAppSettingsWithDefaults
+};

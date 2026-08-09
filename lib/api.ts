@@ -1,0 +1,5259 @@
+// API Configuration and HTTP Client
+import axios, { AxiosInstance, AxiosResponse, AxiosError } from 'axios'
+import { handleSessionExpired } from './auth-utils'
+import { isPublicClientRoute } from './public-routes'
+import { getCsrfToken, setCsrfTokenPersisted, CSRF_HEADER_NAME } from './csrf'
+import type {
+  AnalyticsClientsTabData,
+  AnalyticsProductsTabData,
+  AnalyticsRevenueTabData,
+  AnalyticsServicesTabData,
+  AnalyticsStaffDrillDownData,
+  AnalyticsStaffTabData,
+} from "@/lib/types/analytics"
+import type { PaymentConfiguration } from "./payment-redemption-eligibility"
+import type { PlanSubscriptionId } from "@/lib/plan-ids"
+
+// API Base Configuration
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001/api'
+
+/**
+ * Refresh auth session using HttpOnly cookies (credentialed POST). Uses standalone axios so
+ * this can run before apiClient response interceptors complete.
+ */
+let refreshInFlight: Promise<boolean> | null = null
+
+async function refreshAuthTokenOnce(): Promise<boolean> {
+  if (typeof window === 'undefined') return false
+  if (refreshInFlight) return refreshInFlight
+  refreshInFlight = (async () => {
+    try {
+      const res = await axios.post<{ success?: boolean; csrfToken?: string }>(
+        `${API_BASE_URL}/auth/refresh`,
+        {},
+        { withCredentials: true, timeout: 25000 }
+      )
+      const t = res.data?.csrfToken
+      if (typeof t === 'string' && t.trim()) {
+        setCsrfTokenPersisted(t)
+      }
+      return res.data?.success === true
+    } catch {
+      return false
+    } finally {
+      refreshInFlight = null
+    }
+  })()
+  return refreshInFlight
+}
+
+function normalizeApiErrorMessage(data: unknown): string {
+  if (!data || typeof data !== 'object') return ''
+  const d = data as { error?: unknown; message?: unknown }
+  if (typeof d.error === 'string') return d.error
+  if (typeof d.message === 'string') return d.message
+  return ''
+}
+
+/** Plan/addon entitlement denials — not RBAC; callers should handle these locally. */
+function isEntitlementOrAddonDenied(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false
+  const code = (data as { code?: string }).code
+  return (
+    code === 'FEATURE_NOT_AVAILABLE' ||
+    code === 'WABA_ADDON_DISABLED' ||
+    code === 'ADDON_NOT_AVAILABLE' ||
+    code === 'LIMIT_REACHED'
+  )
+}
+
+/**
+ * Parses failed API responses thrown as Axios errors (caller usually uses `axios.isAxiosError`).
+ * Prefer this over reading `catch (e)` ad hoc across the codebase.
+ */
+export function apiErrorMessage(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const rd = error.response?.data as unknown
+    const fromBody = normalizeApiErrorMessage(rd)
+    if (fromBody) return fromBody
+    if (typeof rd === 'string' && rd.trim()) return rd.trim()
+
+    const st = error.response?.status
+    if (!error.response) {
+      const code = error.code
+      if (code === 'ECONNABORTED') return 'Request timed out. Check your connection and try again.'
+      if (code === 'ERR_NETWORK' || error.message === 'Network Error') {
+        return 'Unable to reach the server. Check your connection and API settings.'
+      }
+    }
+    if (typeof st === 'number') {
+      const txt = error.response?.statusText
+      return txt ? `${txt} (${st})` : `Request failed (${st})`
+    }
+    return error.message || 'Request failed'
+  }
+  if (error instanceof Error) return error.message
+  if (typeof error === 'string' && error.trim()) return error.trim()
+  return 'Something went wrong'
+}
+
+/** When Axios rejects with `{ success:false, error? }`, turn it back into `ApiResponse` for uniform handling. */
+function coerceThrownResponseToFailure<T>(
+  caught: unknown
+): ApiResponse<T> | null {
+  if (!axios.isAxiosError(caught)) return null
+  const rd = caught.response?.data as unknown
+  if (rd == null || typeof rd !== 'object') return null
+  const raw = rd as Partial<ApiResponse<T>> & { error?: unknown; message?: unknown; success?: boolean }
+  if (raw.success === false) return rd as ApiResponse<T>
+  if (typeof raw.error === 'string' || typeof raw.message === 'string') {
+    return {
+      success: false,
+      error:
+        normalizeApiErrorMessage(rd) ||
+        (typeof raw.error === 'string'
+          ? raw.error
+          : typeof raw.message === 'string'
+            ? raw.message
+            : apiErrorMessage(caught)),
+      message: typeof raw.message === 'string' ? raw.message : undefined,
+      data: (raw.data ?? null) as unknown as T,
+    }
+  }
+  return null
+}
+
+/** True when 401/403 indicates invalid/expired session (not business-rule or RBAC). */
+function isTokenAuthFailure(status: number | undefined, errorMsg: string): boolean {
+  const m = errorMsg.toLowerCase()
+  if (m.includes('business_suspended')) return false
+  /** Backend CSRF failures use "Invalid CSRF token" — must not trigger JWT logout. */
+  if (m.includes('csrf')) return false
+  if (status === 401) return true
+  if (status !== 403) return false
+  return (
+    (m.includes('invalid') && m.includes('token')) ||
+    m.includes('expired') ||
+    m.includes('access token') ||
+    m.includes('authentication required') ||
+    m.includes('user not found')
+  )
+}
+
+function logApiResponseError(error: AxiosError | any) {
+  try {
+    const errorInfo: any = {
+      message: 'Unknown error',
+      errorType: typeof error,
+    }
+
+    if (error?.message) {
+      errorInfo.message = String(error.message)
+    } else if (typeof error === 'string') {
+      errorInfo.message = error
+    } else if (error?.toString && typeof error.toString === 'function') {
+      try {
+        errorInfo.message = String(error.toString())
+      } catch {
+        errorInfo.message = 'Error converting to string'
+      }
+    }
+
+    if (error?.config) {
+      errorInfo.url = String(error.config.url || 'Unknown URL')
+      errorInfo.method = String(error.config.method?.toUpperCase() || 'Unknown method')
+    }
+
+    if (error?.response) {
+      errorInfo.status = Number(error.response.status)
+      errorInfo.statusText = String(error.response.statusText || '')
+      errorInfo.data = error.response.data
+      errorInfo.type = 'HTTP Error'
+
+      if (error.response.data) {
+        if (typeof error.response.data === 'string') {
+          errorInfo.error = error.response.data
+          errorInfo.message = error.response.data
+        } else if (typeof error.response.data === 'object') {
+          errorInfo.error =
+            error.response.data.error ||
+            error.response.data.message ||
+            error.response.data.details ||
+            JSON.stringify(error.response.data)
+          errorInfo.message = errorInfo.error
+        }
+      }
+
+      if (!errorInfo.error && errorInfo.statusText) {
+        errorInfo.error = errorInfo.statusText
+        errorInfo.message = errorInfo.statusText
+      }
+    } else if (error?.request) {
+      errorInfo.type = 'Network Error'
+      errorInfo.code = String(error?.code || 'NETWORK_ERROR')
+    } else {
+      errorInfo.type = 'Request Setup Error'
+      errorInfo.code = String(error?.code || 'SETUP_ERROR')
+    }
+
+    const pathname = typeof window !== 'undefined' ? window.location.pathname : ''
+    const isPublicRoute = pathname && isPublicClientRoute(pathname)
+    const isLoginPage = typeof window !== 'undefined' && window.location.pathname.includes('/login')
+    const urlStr = String(errorInfo.url || error?.config?.url || '')
+    const isAuthProbe =
+      errorInfo.status === 401 &&
+      (urlStr.includes('/auth/profile') || urlStr.includes('/auth/refresh'))
+    if ((isLoginPage || isPublicRoute) && isAuthProbe) {
+      // Silent: expected 401 when probing for existing session on the login page
+    } else if (errorInfo.status === 404) {
+      if (errorInfo.url && errorInfo.url !== 'Unknown URL') {
+        console.warn(`⚠️ API 404: ${errorInfo.method} ${errorInfo.url} - ${errorInfo.message || 'Not Found'}`)
+      }
+    } else if (errorInfo.status === 0 || errorInfo.type === 'Network Error') {
+      const url = error?.config?.url || errorInfo.url
+      const baseUrl = error?.config?.baseURL || ''
+      console.warn(
+        `⚠️ API Network Error: Cannot reach backend. Ensure the server is running on ${baseUrl || 'port 3001'}.`,
+        url ? `Request: ${url}` : ''
+      )
+    } else {
+      const status = errorInfo.status ?? error?.response?.status
+      const data = errorInfo.data ?? error?.response?.data
+      const errMsg =
+        typeof data === 'object' && data !== null
+          ? (data as any).error || (data as any).errorDetail || (data as any).message || (data as any).details
+          : typeof data === 'string'
+            ? data
+            : null
+      const message =
+        typeof errMsg === 'string' && errMsg.trim()
+          ? errMsg
+          : errorInfo.error || errorInfo.message || errorInfo.statusText || `Request failed with status ${status}`
+
+      const url = error?.config?.url
+      const method = error?.config?.method?.toUpperCase()
+      const logFn = status >= 400 && status < 500 ? console.warn : console.error
+      logFn(`API ${status || ''} ${method || ''} ${url || ''}:`, message)
+    }
+  } catch (logError) {
+    console.error('❌ API Response Interceptor: Failed to process error:', logError)
+    console.error('❌ API Response Interceptor: Original error object:', error)
+    console.error('❌ API Response Interceptor: Error keys:', error ? Object.keys(error) : 'null')
+  }
+}
+
+// Create axios instance with default config
+const apiClient: AxiosInstance = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 30000,
+  withCredentials: true,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+})
+
+/** Dev-only: count outgoing API requests (read via `window.__getSalonApiRequestCount?.()` in the browser console). */
+let devApiRequestCount = 0
+if (typeof window !== 'undefined' && process.env.NODE_ENV === 'development') {
+  apiClient.interceptors.request.use((config) => {
+    devApiRequestCount += 1
+    const g = globalThis as unknown as {
+      __salonApiRequestCount?: number
+      __getSalonApiRequestCount?: () => number
+    }
+    g.__salonApiRequestCount = devApiRequestCount
+    g.__getSalonApiRequestCount = () => devApiRequestCount
+    return config
+  })
+}
+
+/** Ensures sessionStorage has a CSRF mirror before mutating requests (cross-origin cannot read ems_csrf cookie). */
+let csrfBootstrapInFlight: Promise<void> | null = null
+
+function ensureCsrfTokenForMutatingRequest(): Promise<void> {
+  if (typeof window === 'undefined') return Promise.resolve()
+  if (getCsrfToken()) return Promise.resolve()
+  if (csrfBootstrapInFlight) return csrfBootstrapInFlight
+  csrfBootstrapInFlight = (async () => {
+    try {
+      await apiClient.get('/auth/csrf')
+    } catch {
+      /* ignore — caller may still 403 */
+    } finally {
+      csrfBootstrapInFlight = null
+    }
+  })()
+  return csrfBootstrapInFlight
+}
+
+// Request interceptor: attach CSRF token for mutating methods (cookies carry auth automatically)
+apiClient.interceptors.request.use(
+  async (config) => {
+    if (typeof window !== 'undefined') {
+      const method = (config.method || 'get').toUpperCase()
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+        const url = String(config.url || '')
+        const skipCsrfBootstrap =
+          url.includes('/auth/login') ||
+          url.includes('/auth/staff-login') ||
+          url.includes('/auth/refresh') ||
+          url.includes('/auth/forgot-password') ||
+          url.includes('/auth/reset-password')
+        if (!skipCsrfBootstrap) {
+          await ensureCsrfTokenForMutatingRequest()
+        }
+        const csrf = getCsrfToken()
+        if (csrf) {
+          config.headers[CSRF_HEADER_NAME] = csrf
+        }
+      }
+    }
+    return config
+  },
+  (error) => {
+    console.error('❌ API Request Interceptor Error:', error)
+    return Promise.reject(error)
+  }
+)
+
+// Response interceptor: persist CSRF for cross-origin SPAs (API host cookie not visible to document.cookie)
+apiClient.interceptors.response.use(
+  (response: AxiosResponse) => {
+    const url = String(response.config?.url || '')
+    const data = response.data as { csrfToken?: string } | undefined
+    if (
+      data?.csrfToken &&
+      typeof data.csrfToken === 'string' &&
+      data.csrfToken.trim() &&
+      (url.includes('/auth/profile') ||
+        url.includes('/auth/refresh') ||
+        url.includes('/auth/csrf'))
+    ) {
+      setCsrfTokenPersisted(data.csrfToken)
+    }
+    return response
+  },
+  async (error: AxiosError | any) => {
+    if (!error) {
+      console.error('❌ API Response Interceptor: Error is null or undefined')
+      return Promise.reject(error)
+    }
+
+    const config = error.config as any
+
+    // Retry transient network / timeout (common after tab sleep or first request after idle)
+    if (config && !error.response) {
+      const code = error.code
+      const msg = String(error.message || '')
+      const retryable =
+        code === 'ECONNABORTED' || code === 'ERR_NETWORK' || msg === 'Network Error'
+      if (retryable && (config.__networkRetryCount || 0) < 2) {
+        config.__networkRetryCount = (config.__networkRetryCount || 0) + 1
+        await new Promise((r) => setTimeout(r, 500 * config.__networkRetryCount))
+        return apiClient(config)
+      }
+    }
+
+    const status = error?.response?.status
+    const errBody = error?.response?.data
+    const errorMsg = normalizeApiErrorMessage(errBody)
+
+    if (typeof window !== 'undefined' && config && !config.__retryAfterRefresh) {
+      const url = String(config.url || '')
+      /**
+       * /auth/logout failing with 401 means the access token is already gone —
+       * trying to refresh is pointless and creates `tenant_refresh_failure` +
+       * `tenant_session_expired_client` audit noise. Treat it as a successful
+       * local logout instead.
+       */
+      const skipRefresh =
+        url.includes('/auth/refresh') ||
+        url.includes('/auth/login') ||
+        url.includes('/auth/staff-login') ||
+        url.includes('/auth/logout')
+      const pathname = typeof window !== 'undefined' ? window.location.pathname : ''
+      const onPublicRoute = !!pathname && isPublicClientRoute(pathname)
+      if (!skipRefresh && !onPublicRoute && isTokenAuthFailure(status, errorMsg)) {
+        config.__retryAfterRefresh = true
+        const refreshed = await refreshAuthTokenOnce()
+        if (refreshed) {
+          return apiClient(config)
+        }
+      }
+    }
+
+    if (error?.response?.data) {
+      error.responseData = error.response.data
+    }
+
+    logApiResponseError(error)
+
+    const statusOut = error?.response?.status
+    const errorMsgLower = normalizeApiErrorMessage(error?.response?.data).toLowerCase()
+
+    if (statusOut === 401 || statusOut === 403) {
+      const pathname = typeof window !== 'undefined' ? window.location.pathname : ''
+      const reqUrl = String(config?.url || '')
+      const isAuthSessionProbe =
+        reqUrl.includes('/auth/profile') || reqUrl.includes('/auth/refresh')
+      /**
+       * A 401 on /auth/logout just means the session was already gone — the caller
+       * (AuthProvider.logout) already clears storage and redirects. Don't fire the
+       * handleSessionExpired cascade; it would spam `session_expired_client` audit
+       * events and interfere with the in-progress logout redirect.
+       */
+      const isLogoutCall = reqUrl.includes('/auth/logout')
+      const skipRedirectForAnonymousMarketing =
+        !!pathname &&
+        isPublicClientRoute(pathname) &&
+        isAuthSessionProbe &&
+        !errorMsgLower.includes('business_suspended')
+
+      if (typeof window !== 'undefined' && !skipRedirectForAnonymousMarketing && !isLogoutCall) {
+        if (statusOut === 403 && errorMsgLower.includes('business_suspended')) {
+          if (!window.location.pathname.includes('/account-suspended')) {
+            window.location.href = '/account-suspended'
+          }
+          return Promise.reject(error)
+        }
+
+        const isPermissionDenied =
+          statusOut === 403 &&
+          !isEntitlementOrAddonDenied(error?.response?.data) &&
+          (errorMsgLower.includes('insufficient permissions') ||
+            errorMsgLower.includes('insufficient admin permissions'))
+
+        if (isPermissionDenied) {
+          if (process.env.NODE_ENV === 'development') {
+            console.log('🔐 API 403: Permission denied, redirecting to unauthorized')
+          }
+          window.location.href = '/unauthorized'
+        } else if (isTokenAuthFailure(statusOut, errorMsgLower)) {
+          if (process.env.NODE_ENV === 'development') {
+            console.log('🔐 API Response Interceptor: Session invalid (', statusOut, '), redirecting to login')
+          }
+          handleSessionExpired('/login', {
+            source: 'api_interceptor',
+            status: statusOut,
+            requestUrl: String(config?.url || ''),
+            errorMessage: errorMsgLower,
+          })
+        }
+        // Other 403s (validation, cross-branch, etc.): do not logout — let callers show the error
+      }
+    }
+    return Promise.reject(error)
+  }
+)
+
+// API Response Types
+export interface ApiResponse<T = any> {
+  success: boolean
+  data: T
+  message?: string
+  error?: string
+  /** Machine-readable error/success code from the API (e.g. GUPSHUP_TEMPLATE_DUPLICATE_NEEDS_RENAME). */
+  code?: string
+  /** Suggested alternate template name when Meta rejects duplicate elementName. */
+  suggestedName?: string
+  /** GET /sales and other list endpoints may include timing/pagination hints */
+  meta?: {
+    durationMs?: number
+    page?: number
+    limit?: number
+    hasMore?: boolean
+  }
+}
+
+export interface PaginatedResponse<T> extends ApiResponse<T[]> {
+  pagination: {
+    page: number
+    limit: number
+    total: number
+    totalPages: number
+  }
+}
+
+// API Service Classes
+export class AuthAPI {
+  static async login(
+    email: string,
+    password: string
+  ): Promise<
+    ApiResponse<{
+      user?: any
+      csrfToken?: string
+      requiresBranchSelect?: boolean
+      preAuthToken?: string
+      branches?: AuthBranchOption[]
+    }>
+  > {
+    const response = await apiClient.post('/auth/login', { email, password })
+    return response.data
+  }
+
+  /**
+   * @param reason — optional short tag explaining the source. The backend writes this into
+   * the tenant_logout_success audit line so we can distinguish user-initiated logouts from
+   * session-timeout or interceptor-driven ones in production.
+   */
+  static async logout(reason?: string): Promise<ApiResponse> {
+    const body = reason && typeof reason === 'string' ? { reason } : {}
+    const response = await apiClient.post('/auth/logout', body)
+    return response.data
+  }
+
+  static async getProfile(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/auth/profile')
+    return response.data
+  }
+
+  static async extendBillingOneDay(): Promise<
+    ApiResponse<{
+      renewalDate: string | null
+      businessSuspended: boolean
+      nextBillingDate: string | null
+      billingOneDayExtensionAvailable: boolean
+    }>
+  > {
+    const response = await apiClient.post('/auth/billing-one-day-extension')
+    return response.data
+  }
+
+  static async refreshToken(): Promise<ApiResponse & { csrfToken?: string }> {
+    const response = await apiClient.post('/auth/refresh')
+    return response.data
+  }
+
+  static async forgotPassword(email: string): Promise<ApiResponse<{ message: string; resetUrl?: string }>> {
+    const response = await apiClient.post('/auth/forgot-password', { email })
+    return response.data
+  }
+
+  static async resetPassword(token: string, newPassword: string): Promise<ApiResponse<{ message: string }>> {
+    const response = await apiClient.post('/auth/reset-password', { token, newPassword })
+    return response.data
+  }
+
+  static async verifyResetToken(token: string): Promise<ApiResponse<{ email: string; name: string; role: string }>> {
+    const response = await apiClient.get(`/auth/verify-reset-token/${token}`)
+    return response.data
+  }
+
+  static async staffLogin(email: string, password: string, businessCode: string): Promise<ApiResponse<{ user: any; csrfToken?: string }>> {
+    const response = await apiClient.post('/auth/staff-login', { email, password, businessCode })
+    return response.data
+  }
+
+  /**
+   * Multi-branch: redeem the short-lived pre-auth token for a full session on the
+   * chosen branch. The pre-auth token is passed as a Bearer header (no session
+   * cookies exist yet); the endpoint is CSRF-exempt for this reason.
+   */
+  static async selectBranch(
+    branchId: string,
+    preAuthToken: string
+  ): Promise<ApiResponse<{ user: any; csrfToken?: string }>> {
+    const response = await apiClient.post(
+      '/auth/select-branch',
+      { branchId },
+      { headers: { Authorization: `Bearer ${preAuthToken}` } }
+    )
+    return response.data
+  }
+
+  /** Multi-branch: switch the active branch mid-session (uses existing session + CSRF). */
+  static async switchBranch(branchId: string): Promise<ApiResponse<{ csrfToken?: string }>> {
+    const response = await apiClient.post('/auth/switch-branch', { branchId })
+    return response.data
+  }
+
+  /** Multi-branch: list active branches owned by the current owner (empty for staff). */
+  static async getMyBranches(): Promise<ApiResponse<{ branches: AuthBranchOption[] }>> {
+    const response = await apiClient.get('/auth/my-branches')
+    return response.data
+  }
+}
+
+/** A branch option surfaced to the SPA for the picker and switcher. */
+export interface AuthBranchOption {
+  id: string
+  code: string
+  name: string
+  city: string
+  logo: string
+}
+
+/* ----------------------------------------------------------------- */
+/* Branch Management (multi-branch admin surface)                    */
+/* ----------------------------------------------------------------- */
+
+export type BranchPeriod = 'daily' | 'weekly' | 'monthly'
+
+/** ISO 'YYYY-MM-DD' date range passed to the cross-branch read endpoints. */
+export interface BranchDateRangeParams {
+  from?: string
+  to?: string
+  includeInactive?: boolean
+}
+
+export interface BranchSummaryRow {
+  branchId: string
+  branchName: string
+  city: string
+  status: string
+  revenue: number
+  appointments: number
+  completedAppointments: number
+  avgTicketSize: number
+  staff: number
+  clients: number
+  capacityUtilizationPct?: number
+  avgRating?: number | null
+  revenueTarget?: number
+  revenueVsTargetPct?: number | null
+  error?: string | null
+}
+
+export interface BranchCacheCoverage {
+  totalBranchDays: number
+  cachedBranchDays: number
+  liveBranchDays: number
+  source: "cache" | "hybrid" | "live"
+}
+
+export interface BranchSummaryResponse {
+  aggregate: {
+    revenue: number
+    appointments: number
+    completedAppointments: number
+    avgTicketSize: number
+    staff: number
+    clients: number
+    capacityUtilizationPct?: number
+    avgRating?: number | null
+    revenueTarget?: number
+    revenueVsTargetPct?: number | null
+  }
+  branches: BranchSummaryRow[]
+  range: { from: string; to: string }
+  cacheCoverage?: BranchCacheCoverage
+}
+
+export interface BranchTimeSeriesResponse {
+  labels: string[]
+  series: BranchSeries[]
+  granularity: BranchPeriod
+  cacheCoverage?: BranchCacheCoverage
+}
+
+export interface TopPerformerService {
+  name: string
+  count: number
+  revenue: number
+}
+
+export interface TopPerformerStaff {
+  name: string
+  revenue: number
+}
+
+export interface TopPerformersResponse {
+  topServices: TopPerformerService[]
+  topStaff: TopPerformerStaff[]
+  range: { from: string; to: string }
+}
+
+export interface BranchSeries {
+  branchId: string
+  branchName: string
+  error?: string | null
+  data: number[]
+}
+
+export interface BranchStaffRow {
+  id: string
+  name: string
+  role: string
+  /** True when bill staffId could not be matched to the branch staff directory */
+  unlinked?: boolean
+  isActive: boolean
+  avatar: string
+  servicesDone: number
+  revenue: number
+  utilizationPct: number
+  /** @deprecated use utilizationPct */
+  attendancePct?: number
+}
+
+export interface StaffCompareResponse {
+  labels: string[]
+  series: { metric: string; data: number[] }[]
+  branches: { branchId: string; branchName: string; error?: string | null }[]
+  range: { from: string; to: string }
+}
+
+export interface BranchStaffGroup {
+  branchId: string
+  branchName: string
+  error?: string | null
+  staff: BranchStaffRow[]
+}
+
+export interface BranchInventoryItem {
+  id: string
+  name: string
+  category: string
+  currentStock: number
+  reorderLevel: number
+  lowStock: boolean
+}
+
+export interface BranchInventoryGroup {
+  branchId: string
+  branchName: string
+  error?: string | null
+  products: BranchInventoryItem[]
+}
+
+export type InventoryStockStatus = 'green' | 'amber' | 'red' | 'zero'
+
+export interface BranchInventoryCell {
+  stock: number
+  reorderLevel: number
+  status: InventoryStockStatus
+  lastRestockedAt?: string | null
+}
+
+export interface InventoryMatrixProduct {
+  key: string
+  name: string
+  sku: string
+  category: string
+  branches: Record<string, BranchInventoryCell>
+}
+
+export interface InventoryMatrixResponse {
+  branches: { branchId: string; branchName: string; error?: string | null }[]
+  products: InventoryMatrixProduct[]
+}
+
+export interface BranchClientMembership {
+  id: string
+  planName: string
+  startDate: string | null
+  expiryDate: string | null
+  remainingSessions: number | null
+}
+
+export interface BranchClientMatch {
+  branchId: string
+  branchName: string
+  error?: string | null
+  found: boolean
+  client: {
+    id: string
+    name: string
+    phone: string
+    email: string
+    lastVisit: string | null
+    totalVisits: number
+    totalSpent: number
+  } | null
+  memberships: BranchClientMembership[]
+}
+
+export interface BranchListItem {
+  id: string
+  code: string
+  name: string
+  city: string
+  logo: string
+  status: string
+  createdAt: string
+  managerName: string
+  isActive: boolean
+  isCurrent: boolean
+}
+
+export interface AddBranchPayload {
+  branchName: string
+  city: string
+  phone: string
+  address: string
+  state?: string
+  zipCode?: string
+  email?: string
+  managerId?: string
+}
+
+export type WeekDay =
+  | 'monday'
+  | 'tuesday'
+  | 'wednesday'
+  | 'thursday'
+  | 'friday'
+  | 'saturday'
+  | 'sunday'
+
+export interface DayHours {
+  open: string
+  close: string
+  closed: boolean
+}
+
+export interface AppointmentSettingsData {
+  code: string
+  name: string
+  timezone: string
+  allowOnlineBooking: boolean
+  /** False when the current subscription plan does not include online_booking. */
+  onlineBookingAvailable?: boolean
+  slotDuration: 15 | 30
+  advanceBookingDays: number
+  bufferTime: number
+  cancellationWindowHours: number
+  operatingHours: Record<WeekDay, DayHours>
+  bookingTagline?: string
+  showcaseImages?: string[]
+  bookingHeroTheme?: import("@/lib/booking-hero-themes").BookingHeroThemeId
+  websiteEnabled?: boolean
+  miniSiteSlug?: string
+  miniSiteBookPath?: string
+}
+
+export interface AppointmentSettingsUpdatePayload {
+  allowOnlineBooking?: boolean
+  slotDuration?: 15 | 30
+  advanceBookingDays?: number
+  bufferTime?: number
+  cancellationWindowHours?: number
+  operatingHours?: Partial<Record<WeekDay, Partial<DayHours>>>
+  bookingTagline?: string
+  showcaseImages?: string[]
+  bookingHeroTheme?: import("@/lib/booking-hero-themes").BookingHeroThemeId
+}
+
+export interface BranchConfig {
+  id: string
+  code: string
+  name: string
+  status: string
+  address: { street: string; city: string; state: string; zipCode: string }
+  phone: string
+  email: string
+  allowOnlineBooking: boolean
+  allowCrossBranchBooking?: boolean
+  cancellationWindowHours?: number
+  revenueTargetMonthly?: number
+  operatingHours: Record<WeekDay, DayHours>
+}
+
+export interface UpdateBranchPayload {
+  name?: string
+  phone?: string
+  email?: string
+  address?: { street?: string; city?: string; state?: string; zipCode?: string }
+  allowOnlineBooking?: boolean
+  allowCrossBranchBooking?: boolean
+  cancellationWindowHours?: number
+  revenueTargetMonthly?: number
+  operatingHours?: Partial<Record<WeekDay, Partial<DayHours>>>
+}
+
+export type ClientSegment = 'new' | 'returning' | 'vip' | 'at_risk'
+
+export interface BranchClientListRow {
+  phone: string
+  name: string
+  email: string
+  totalVisits: number
+  totalSpent: number
+  lastVisit: string | null
+  homeBranchId: string | null
+  segment: ClientSegment
+  allowCrossBranchBooking: boolean
+  branches: {
+    branchId: string
+    branchName: string
+    clientId: string
+    totalVisits: number
+    totalSpent: number
+    lastVisit: string | null
+  }[]
+}
+
+export interface BranchServiceRow {
+  id: string
+  key: string
+  name: string
+  sku: string
+  price: number
+  durationMinutes: number
+  category: string
+  tier: string
+  enabled: boolean
+  hasOverride?: boolean
+}
+
+export interface TransferRequestPermissions {
+  initiatorBranchId: string
+  approverBranchId: string
+  canApprove: boolean
+  canReject: boolean
+  canCancel: boolean
+  isInProcess: boolean
+}
+
+export interface TransferRequestRow {
+  _id: string
+  fromBranchId: string
+  toBranchId: string
+  productKey: string
+  productName: string
+  sku?: string
+  quantity: number
+  status: 'pending' | 'approved' | 'rejected' | 'completed' | 'cancelled'
+  initiatedByBranchId?: string | null
+  permissions?: TransferRequestPermissions
+  notes?: string
+  createdAt: string
+  completedAt?: string | null
+}
+
+export class BranchManagementAPI {
+  static async getSummary(range?: BranchDateRangeParams): Promise<ApiResponse<BranchSummaryResponse>> {
+    const response = await apiClient.get('/branch-management/summary', { params: range })
+    return response.data
+  }
+
+  static async getTopPerformers(
+    range?: BranchDateRangeParams & { limit?: number }
+  ): Promise<ApiResponse<TopPerformersResponse>> {
+    const response = await apiClient.get('/branch-management/overview/top-performers', { params: range })
+    return response.data
+  }
+
+  static async getRevenue(range?: BranchDateRangeParams): Promise<ApiResponse<BranchTimeSeriesResponse>> {
+    const response = await apiClient.get('/branch-management/revenue', { params: range })
+    return response.data
+  }
+
+  static async getAppointments(range?: BranchDateRangeParams): Promise<ApiResponse<BranchTimeSeriesResponse>> {
+    const response = await apiClient.get('/branch-management/appointments', { params: range })
+    return response.data
+  }
+
+  static async getStaff(
+    range?: BranchDateRangeParams
+  ): Promise<ApiResponse<{ branches: BranchStaffGroup[]; range: { from: string; to: string } }>> {
+    const params = range
+      ? {
+          ...range,
+          includeInactive: range.includeInactive !== false ? 'true' : 'false',
+        }
+      : undefined
+    const response = await apiClient.get('/branch-management/staff', { params })
+    return response.data
+  }
+
+  static async getStaffCompare(
+    range?: BranchDateRangeParams & { metric?: 'revenue' | 'services' | 'utilization' }
+  ): Promise<ApiResponse<StaffCompareResponse>> {
+    const response = await apiClient.get('/branch-management/staff/compare', { params: range })
+    return response.data
+  }
+
+  static async getInventory(): Promise<ApiResponse<{ branches: BranchInventoryGroup[] }>> {
+    const response = await apiClient.get('/branch-management/inventory')
+    return response.data
+  }
+
+  static async getInventoryMatrix(): Promise<ApiResponse<InventoryMatrixResponse>> {
+    const response = await apiClient.get('/branch-management/inventory/matrix')
+    return response.data
+  }
+
+  static async updateReorderLevel(payload: {
+    branchId: string
+    productKey: string
+    minimumStock: number
+  }): Promise<ApiResponse<{ branchId: string; productKey: string; minimumStock: number }>> {
+    const response = await apiClient.patch('/branch-management/inventory/reorder', payload)
+    return response.data
+  }
+
+  static async getTransfers(params?: {
+    status?: string
+  }): Promise<ApiResponse<{ transfers: TransferRequestRow[] }>> {
+    const response = await apiClient.get('/branch-management/inventory/transfers', { params })
+    return response.data
+  }
+
+  static async createTransfer(payload: {
+    fromBranchId: string
+    toBranchId: string
+    productKey: string
+    productName: string
+    sku?: string
+    quantity: number
+    notes?: string
+  }): Promise<ApiResponse<{ transfer: TransferRequestRow }>> {
+    const response = await apiClient.post('/branch-management/inventory/transfers', payload)
+    return response.data
+  }
+
+  static async updateTransfer(
+    id: string,
+    payload: { status: 'approved' | 'rejected' | 'cancelled'; notes?: string }
+  ): Promise<ApiResponse<{ transfer: TransferRequestRow; errors?: string[] }>> {
+    const response = await apiClient.patch(`/branch-management/inventory/transfers/${id}`, payload)
+    return response.data
+  }
+
+  static async getClients(params?: {
+    from?: string
+    to?: string
+    branchId?: string
+    segment?: ClientSegment | 'all'
+    search?: string
+    page?: number
+    limit?: number
+  }): Promise<
+    ApiResponse<{
+      clients: BranchClientListRow[]
+      pagination: { page: number; limit: number; total: number; pages: number }
+    }>
+  > {
+    const response = await apiClient.get('/branch-management/clients', { params })
+    return response.data
+  }
+
+  static async searchClient(
+    phone: string
+  ): Promise<ApiResponse<{ query: string; homeBranchId: string | null; branches: BranchClientMatch[] }>> {
+    const response = await apiClient.get('/branch-management/clients/search', { params: { phone } })
+    return response.data
+  }
+
+  static async getBranches(): Promise<ApiResponse<{ branches: BranchListItem[] }>> {
+    const response = await apiClient.get('/branch-management/branches')
+    return response.data
+  }
+
+  static async addBranch(
+    payload: AddBranchPayload
+  ): Promise<ApiResponse<{ branch: { id: string; code: string; name: string; city: string; status: string } }>> {
+    const response = await apiClient.post('/branch-management/branches/add', payload)
+    return response.data
+  }
+
+  static async setBranchStatus(
+    branchId: string,
+    isActive: boolean
+  ): Promise<ApiResponse<{ branch: { id: string; code: string; name: string; status: string; isActive: boolean } }>> {
+    const response = await apiClient.patch(`/branch-management/branches/${branchId}/status`, { isActive })
+    return response.data
+  }
+
+  static async getBranchConfig(branchId: string): Promise<ApiResponse<{ config: BranchConfig }>> {
+    const response = await apiClient.get(`/branch-management/branches/${branchId}/config`)
+    return response.data
+  }
+
+  static async updateBranch(
+    branchId: string,
+    payload: UpdateBranchPayload
+  ): Promise<ApiResponse<{ config: BranchConfig }>> {
+    const response = await apiClient.patch(`/branch-management/branches/${branchId}`, payload)
+    return response.data
+  }
+
+  static async getBranchServices(
+    branchId: string
+  ): Promise<ApiResponse<{ services: BranchServiceRow[] }>> {
+    const response = await apiClient.get(`/branch-management/branches/${branchId}/services`)
+    return response.data
+  }
+
+  static async updateBranchServices(
+    branchId: string,
+    overrides: Record<
+      string,
+      { enabled?: boolean; durationMinutes?: number; price?: number; tier?: 'standard' | 'premium' }
+    >
+  ): Promise<ApiResponse<{ serviceOverrides: Record<string, unknown> }>> {
+    const response = await apiClient.patch(`/branch-management/branches/${branchId}/services`, {
+      overrides,
+    })
+    return response.data
+  }
+
+  static async copyBranchServices(
+    targetBranchId: string,
+    payload: {
+      sourceBranchId: string
+      includeCatalog?: boolean
+      includeOverrides?: boolean
+      onConflict?: 'skip' | 'update'
+    }
+  ): Promise<
+    ApiResponse<{
+      created: number
+      updated: number
+      skipped: number
+      overridesCopied: number
+      warnings: Array<{ name: string; reason: string }>
+    }>
+  > {
+    const response = await apiClient.post(
+      `/branch-management/branches/${targetBranchId}/services/copy`,
+      payload
+    )
+    return response.data
+  }
+
+  static async getOrgSettings(): Promise<
+    ApiResponse<{ shareClientsAcrossBranches: boolean }>
+  > {
+    const response = await apiClient.get('/branch-management/org-settings')
+    return response.data
+  }
+
+  static async updateOrgSettings(payload: {
+    shareClientsAcrossBranches: boolean
+  }): Promise<
+    ApiResponse<{ shareClientsAcrossBranches: boolean; branchesUpdated: number }>
+  > {
+    const response = await apiClient.patch('/branch-management/org-settings', payload)
+    return response.data
+  }
+}
+
+export class ClientsAPI {
+  static async getAll(params?: { page?: number; limit?: number; search?: string }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/clients', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/clients/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/clients', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/clients/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/clients/${id}`)
+    return response.data
+  }
+
+  static async search(query: string, opts?: { limit?: number }): Promise<ApiResponse<any[]>> {
+    const params: Record<string, string | number> = { q: query }
+    if (opts?.limit) params.limit = opts.limit
+    const response = await apiClient.get('/clients/search', { params })
+    return response.data
+  }
+
+  static async ensureShared(phone: string): Promise<ApiResponse<any> & { created?: boolean }> {
+    const response = await apiClient.post('/clients/ensure-shared', { phone })
+    return response.data
+  }
+
+  static async getBulkStats(clientIds: string[]): Promise<
+    ApiResponse<
+      Record<string, { totalVisits: number; totalSpent: number; lastVisit: string; totalDues: number }>
+    >
+  > {
+    const CHUNK = 250
+    const ids = [...new Set(clientIds.map((id) => String(id || '').trim()).filter(Boolean))]
+    if (ids.length === 0) {
+      return { success: true, data: {} } as ApiResponse<
+        Record<string, { totalVisits: number; totalSpent: number; lastVisit: string; totalDues: number }>
+      >
+    }
+    const merged: Record<
+      string,
+      { totalVisits: number; totalSpent: number; lastVisit: string; totalDues: number }
+    > = {}
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const slice = ids.slice(i, i + CHUNK)
+      const response = await apiClient.post('/clients/bulk-stats', { clientIds: slice })
+      const payload = response.data as ApiResponse<
+        Record<string, { totalVisits: number; totalSpent: number; lastVisit: string; totalDues: number }>
+      >
+      if (payload.success && payload.data) {
+        Object.assign(merged, payload.data)
+      }
+    }
+    return { success: true, data: merged }
+  }
+
+  static async getStats(): Promise<ApiResponse<{ totalCustomers: number; activeCustomers: number; inactiveCustomers: number }>> {
+    const response = await apiClient.get('/clients/stats')
+    return response.data
+  }
+}
+
+export class ServicesAPI {
+  static async getAll(params?: { page?: number; limit?: number; search?: string }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/services', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/services/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/services', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/services/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/services/${id}`)
+    return response.data
+  }
+
+  static async bulkUpdateTaxApplicable(taxApplicable: boolean): Promise<ApiResponse<{ modifiedCount: number }>> {
+    const response = await apiClient.patch('/services/tax-applicable', { taxApplicable })
+    return response.data
+  }
+}
+
+export class ConsumptionRulesAPI {
+  static async list(params?: { serviceId?: string }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/consumption-rules', { params })
+    return response.data
+  }
+  static async create(data: { serviceId: string; productId: string; quantityUsed: number; unit: string; isAdjustable?: boolean; maxAdjustmentPercent?: number; variantKey?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/consumption-rules', data)
+    return response.data
+  }
+  static async update(id: string, data: { quantityUsed?: number; unit?: string; isAdjustable?: boolean; maxAdjustmentPercent?: number; variantKey?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/consumption-rules/${id}`, data)
+    return response.data
+  }
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/consumption-rules/${id}`)
+    return response.data
+  }
+  static async bulkCreate(serviceId: string, rules: { productId: string; quantityUsed: number; unit: string; isAdjustable?: boolean; maxAdjustmentPercent?: number; variantKey?: string }[]): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.post('/consumption-rules/bulk', { serviceId, rules })
+    return response.data
+  }
+}
+
+export class ConsumptionLogsAPI {
+  static async list(params?: { productId?: string; serviceId?: string; billId?: string; fromDate?: string; toDate?: string; limit?: number }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/consumption-logs', { params })
+    return response.data
+  }
+}
+
+export class ProductsAPI {
+  static async getAll(params?: { page?: number; limit?: number; search?: string }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/products', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/products/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/products', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    console.log('🔍 ProductsAPI.update - Making PUT request to:', `/products/${id}`)
+    console.log('🔍 ProductsAPI.update - Full URL will be:', `${API_BASE_URL}/products/${id}`)
+    console.log('🔍 ProductsAPI.update - Data being sent:', data)
+    const response = await apiClient.put(`/products/${id}`, data)
+    console.log('🔍 ProductsAPI.update - Response received:', response.status, response.data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/products/${id}`)
+    return response.data
+  }
+
+  static async updateStock(id: string, quantity: number, operation: 'decrease' | 'increase' = 'decrease'): Promise<ApiResponse<any>> {
+    const response = await apiClient.patch(`/products/${id}/stock`, { quantity, operation })
+    return response.data
+  }
+}
+
+export class SuppliersAPI {
+  static async getSummary(): Promise<ApiResponse<{ totalSuppliers: number; totalOutstanding: number; purchasesThisMonth: number; overdueAmount: number }>> {
+    const response = await apiClient.get('/suppliers/summary')
+    return response.data
+  }
+
+  static async getAll(params?: { search?: string; activeOnly?: boolean; withSummary?: boolean | string }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/suppliers', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/suppliers/${id}`)
+    return response.data
+  }
+
+  static async getOrders(id: string): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get(`/suppliers/${id}/orders`)
+    return response.data
+  }
+
+  static async getOutstanding(id: string): Promise<ApiResponse<{ outstanding: number; payables: any[] }>> {
+    const response = await apiClient.get(`/suppliers/${id}/outstanding`)
+    return response.data
+  }
+
+  static async getPaymentTimeline(id: string): Promise<
+    ApiResponse<
+      Array<{ _id: string; paymentDate: string; amount: number; paymentMethod: string; payableReferenceNumber?: string }>
+    >
+  > {
+    const response = await apiClient.get(`/suppliers/${id}/payments`)
+    return response.data
+  }
+
+  /** FIFO by due date: one payment splits across oldest bills first */
+  static async recordPaymentAutoAllocate(
+    supplierId: string,
+    body: {
+      amount: number
+      paymentMethod?: string
+      paymentDate?: string
+      reference?: string
+      notes?: string
+    }
+  ): Promise<
+    ApiResponse<{
+      totalApplied?: number
+      allocations?: Array<{ payableId: string; amountApplied: number; balanceAfter: number }>
+    }>
+  > {
+    const response = await apiClient.post(`/suppliers/${supplierId}/payments/auto-allocate`, body)
+    return response.data
+  }
+
+  static async create(data: {
+    name: string
+    contactPerson?: string
+    phone?: string
+    whatsapp?: string
+    email?: string
+    address?: string
+    gstNumber?: string
+    paymentTerms?: string
+    bankDetails?: string
+    categories?: string[]
+    notes?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/suppliers', data)
+    return response.data
+  }
+
+  static async update(id: string, data: {
+    name?: string
+    contactPerson?: string
+    phone?: string
+    whatsapp?: string
+    email?: string
+    address?: string
+    gstNumber?: string
+    paymentTerms?: string
+    bankDetails?: string
+    categories?: string[]
+    notes?: string
+    isActive?: boolean
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/suppliers/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/suppliers/${id}`)
+    return response.data
+  }
+}
+
+export class PurchaseOrdersAPI {
+  static async getAll(params?: { supplier?: string; status?: string; dateFrom?: string; dateTo?: string; search?: string }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/purchase-orders', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/purchase-orders/${id}`)
+    return response.data
+  }
+
+  static async create(data: {
+    supplierId: string
+    orderDate?: string
+    expectedDeliveryDate?: string
+    items: { productId: string; productName: string; quantity: number; unitCost: number; gstPercent?: number }[]
+    notes?: string
+    status?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/purchase-orders', data)
+    return response.data
+  }
+
+  static async update(id: string, data: {
+    supplierId?: string
+    orderDate?: string
+    expectedDeliveryDate?: string
+    items?: { productId: string; productName: string; quantity: number; unitCost: number; gstPercent?: number }[]
+    notes?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/purchase-orders/${id}`, data)
+    return response.data
+  }
+
+  static async receive(id: string, data: {
+    receivedItems: { productId: string; receivedQty: number; unitCost?: number }[]
+    invoiceUrl?: string
+    grnNotes?: string
+    /** Supplier bill / tax invoice ref for this GRN delivery */
+    supplierInvoiceNumber?: string
+    /** Defaults false: PO receipts only; stock applies when posting the linked purchase invoice. */
+    recordInventory?: boolean
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/purchase-orders/${id}/receive`, data)
+    return response.data
+  }
+
+  static async cancel(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/purchase-orders/${id}/cancel`)
+    return response.data
+  }
+
+  static async deletePermanently(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.delete(`/purchase-orders/${id}`)
+    return response.data
+  }
+
+  static async updateStatus(id: string, data: { status: 'draft' | 'sent' | 'ordered' }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/purchase-orders/${id}/status`, data)
+    return response.data
+  }
+}
+
+export class PurchaseInvoicesAPI {
+  static async getAll(params?: {
+    supplier?: string
+    status?: string
+    paymentStatus?: string
+    dateFrom?: string
+    dateTo?: string
+    search?: string
+  }): Promise<ApiResponse<any[]>> {
+    try {
+      const response = await apiClient.get('/purchase-invoices', { params })
+      return response.data
+    } catch (e: unknown) {
+      const structured = coerceThrownResponseToFailure<any[]>(e)
+      return structured ?? { success: false, error: apiErrorMessage(e), data: [] as any[] }
+    }
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    try {
+      const response = await apiClient.get(`/purchase-invoices/${id}`)
+      return response.data
+    } catch (e: unknown) {
+      const structured = coerceThrownResponseToFailure<any>(e)
+      return structured ?? { success: false, error: apiErrorMessage(e), data: null }
+    }
+  }
+
+  static async create(data: Record<string, unknown>): Promise<ApiResponse<any>> {
+    try {
+      const response = await apiClient.post('/purchase-invoices', data)
+      return response.data
+    } catch (e: unknown) {
+      const structured = coerceThrownResponseToFailure<any>(e)
+      return structured ?? { success: false, error: apiErrorMessage(e), data: null }
+    }
+  }
+
+  static async update(id: string, data: Record<string, unknown>): Promise<ApiResponse<any>> {
+    try {
+      const response = await apiClient.put(`/purchase-invoices/${id}`, data)
+      return response.data
+    } catch (e: unknown) {
+      const structured = coerceThrownResponseToFailure<any>(e)
+      return structured ?? { success: false, error: apiErrorMessage(e), data: null }
+    }
+  }
+
+  static async post(
+    id: string,
+    data?: { confirmLinkedPoDuplicate?: boolean; applyRetailPrices?: boolean; paidAmount?: number; paymentStatus?: string }
+  ): Promise<ApiResponse<any>> {
+    try {
+      const response = await apiClient.post(`/purchase-invoices/${id}/post`, data || {})
+      return response.data
+    } catch (e: unknown) {
+      const structured = coerceThrownResponseToFailure<any>(e)
+      return structured ?? { success: false, error: apiErrorMessage(e), data: null }
+    }
+  }
+
+  static async cancel(id: string): Promise<ApiResponse<any>> {
+    try {
+      const response = await apiClient.post(`/purchase-invoices/${id}/cancel`)
+      return response.data
+    } catch (e: unknown) {
+      const structured = coerceThrownResponseToFailure<any>(e)
+      return structured ?? { success: false, error: apiErrorMessage(e), data: null }
+    }
+  }
+
+  static async deletePermanently(id: string): Promise<ApiResponse<any>> {
+    try {
+      const response = await apiClient.delete(`/purchase-invoices/${id}`)
+      return response.data
+    } catch (e: unknown) {
+      const structured = coerceThrownResponseToFailure<any>(e)
+      return structured ?? { success: false, error: apiErrorMessage(e), data: null }
+    }
+  }
+}
+
+export class SupplierPayablesAPI {
+  static async getAll(params?: { supplier?: string; status?: string; search?: string; dateFrom?: string; dateTo?: string }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/supplier-payables', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/supplier-payables/${id}`)
+    return response.data
+  }
+
+  static async recordPayment(id: string, data: {
+    amount: number
+    paymentMethod?: string
+    paymentDate?: string
+    reference?: string
+    notes?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/supplier-payables/${id}/payments`, data)
+    return response.data
+  }
+}
+
+export class CategoriesAPI {
+  static async getAll(params?: { search?: string; activeOnly?: boolean; type?: 'product' | 'service' }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/categories', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/categories/${id}`)
+    return response.data
+  }
+
+  static async create(data: { name: string; description?: string; type?: 'product' | 'service' | 'both' }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/categories', data)
+    return response.data
+  }
+
+  static async update(id: string, data: { name?: string; description?: string; isActive?: boolean }): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/categories/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/categories/${id}`)
+    return response.data
+  }
+}
+
+export interface TransferEligibilityBranch {
+  id: string
+  name: string
+  city: string
+}
+
+export interface TransferEligibilityResponse {
+  enabled: boolean
+  currentBranchId: string
+  isOrgOwner: boolean
+  branches: TransferEligibilityBranch[]
+}
+
+export interface TransferListParams {
+  page?: number
+  limit?: number
+  status?: string
+  direction?: 'incoming' | 'outgoing' | 'all'
+  search?: string
+}
+
+export interface TransferListResponse {
+  transfers: TransferRequestRow[]
+  pagination: { page: number; limit: number; total: number; pages: number }
+  currentBranchId: string
+  isOrgOwner: boolean
+}
+
+export interface ProductStockByBranch {
+  branchId: string
+  branchName: string
+  stock: number | null
+  found: boolean
+  error?: string
+}
+
+/** Tenant-scoped transfer APIs (Settings → Products tab; staff + owner). */
+export class InventoryTransfersAPI {
+  static async getEligibility(): Promise<ApiResponse<TransferEligibilityResponse>> {
+    const response = await apiClient.get('/inventory/transfers/eligibility')
+    return response.data
+  }
+
+  static async listTransfers(params?: TransferListParams): Promise<ApiResponse<TransferListResponse>> {
+    const response = await apiClient.get('/inventory/transfers', { params })
+    return response.data
+  }
+
+  static async getProductStockAcrossBranches(
+    productKey: string
+  ): Promise<ApiResponse<{ productKey: string; branches: ProductStockByBranch[] }>> {
+    const response = await apiClient.get(
+      `/inventory/transfers/products/${encodeURIComponent(productKey)}/stock`
+    )
+    return response.data
+  }
+
+  static async createTransfer(payload: {
+    fromBranchId: string
+    toBranchId: string
+    productKey: string
+    productName: string
+    sku?: string
+    quantity: number
+    notes?: string
+  }): Promise<ApiResponse<{ transfer: TransferRequestRow }>> {
+    const response = await apiClient.post('/inventory/transfers', payload)
+    return response.data
+  }
+
+  static async updateTransfer(
+    id: string,
+    payload: { status: 'approved' | 'rejected' | 'cancelled'; notes?: string }
+  ): Promise<ApiResponse<{ transfer: TransferRequestRow; errors?: string[] }>> {
+    const response = await apiClient.patch(`/inventory/transfers/${id}`, payload)
+    return response.data
+  }
+}
+
+export class InventoryAPI {
+  static async deductProduct(data: { productId: string; quantity: number; transactionType: string; reason?: string; notes?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/inventory/out', data)
+    return response.data
+  }
+
+  static async recordManualConsumption(body: {
+    entries: Array<{ productId: string; quantity: number; notes?: string }>
+    notes?: string
+  }): Promise<ApiResponse<{ recordedCount: number; warnings: string[] }>> {
+    const response = await apiClient.post('/inventory/manual-consumption', body)
+    return response.data
+  }
+
+  static async getTransactions(params?: { page?: number; limit?: number; productId?: string; transactionType?: string; dateFrom?: string; dateTo?: string }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/inventory/transactions', { params })
+    return response.data
+  }
+
+  static async deleteAllTransactions(): Promise<ApiResponse<any>> {
+    const response = await apiClient.delete('/inventory/transactions')
+    return response.data
+  }
+}
+
+/** User-facing fallback when Mongo unique `slotKey` collides or API returns bare 409. */
+const APPOINTMENT_SLOT_TIME_CONFLICT =
+  "This time slot is already booked for the selected staff member. Please choose a different time."
+
+function recoverAppointmentMutationFromAxiosError(e: unknown): ApiResponse<any> | null {
+  const ax = e as AxiosError<{
+    success?: boolean
+    error?: string
+    conflicts?: Array<{ appointmentId: string; reason: string }>
+  }>
+  if (!ax.response) return null
+  const status = ax.response.status
+  const d = ax.response.data
+  if (!d || typeof d !== "object") {
+    if (status === 409)
+      return { success: false, error: APPOINTMENT_SLOT_TIME_CONFLICT, data: undefined as any }
+    return null
+  }
+  const apiErr =
+    typeof (d as any).error === "string"
+      ? (d as any).error.trim()
+      : typeof (d as any).message === "string"
+        ? String((d as any).message).trim()
+        : ""
+
+  if (status === 409) {
+    const out: ApiResponse<any> & {
+      conflicts?: Array<{ appointmentId: string; reason: string }>
+    } = {
+      success: false,
+      error: apiErr || APPOINTMENT_SLOT_TIME_CONFLICT,
+      data: undefined as any,
+    }
+    if (Array.isArray((d as any).conflicts))
+      out.conflicts = (d as any).conflicts
+    return out
+  }
+  if (status != null && status >= 400 && status < 500 && apiErr) {
+    return { success: false, error: apiErr, data: undefined as any }
+  }
+  return null
+}
+
+export class AppointmentsAPI {
+  static async getAll(params?: {
+    page?: number
+    limit?: number
+    date?: string
+    /** IST `YYYY-MM-DD` lower bound; uses Appointment.date string index. */
+    dateFrom?: string
+    /** IST `YYYY-MM-DD` upper bound (inclusive). */
+    dateTo?: string
+    status?: string
+    clientId?: string
+    /** `calendar` returns minimal client fields (name+phone) and skips visit analytics. */
+    view?: "calendar" | "list"
+    /** Alias for `view` — `minimal` matches the backend short-form projection. */
+    fields?: "minimal" | "full"
+  }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/appointments', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/appointments/${id}`)
+    return response.data
+  }
+
+  static async getByPhone(
+    phone: string,
+    opts?: { limit?: number }
+  ): Promise<ApiResponse<any[]> & { shared?: boolean }> {
+    const encoded = encodeURIComponent(phone || "")
+    const response = await apiClient.get(`/appointments/by-phone/${encoded}`, { params: opts })
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    try {
+      const response = await apiClient.post("/appointments", data)
+      return response.data
+    } catch (e: unknown) {
+      const recovered = recoverAppointmentMutationFromAxiosError(e)
+      if (recovered) return recovered
+      throw e
+    }
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    try {
+      const response = await apiClient.put(`/appointments/${id}`, data)
+      return response.data
+    } catch (e: unknown) {
+      const recovered = recoverAppointmentMutationFromAxiosError(e)
+      if (recovered) return recovered
+      throw e
+    }
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/appointments/${id}`)
+    return response.data
+  }
+
+  static async updateStatus(id: string, status: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.patch(`/appointments/${id}/status`, { status })
+    return response.data
+  }
+
+  static async sendReminder(id: string): Promise<ApiResponse<unknown>> {
+    const response = await apiClient.post(`/appointments/${id}/send-reminder`)
+    return response.data
+  }
+
+  /**
+   * Per-service Raise Sale confirmation step. Each decision either marks an
+   * appointment as performed (optionally shifting it earlier when leading
+   * services are cancelled) or as 'cancelled_at_billing'.
+   *
+   * dryRun=true returns conflict info without persisting.
+   */
+  static async finalizeForBilling(
+    payload: {
+      decisions: Array<{
+        appointmentId: string
+        action: "perform" | "cancel"
+        /** Only the new wall-clock time is required; the server derives startAt/endAt. */
+        shift?: { time: string }
+      }>
+      dryRun?: boolean
+    },
+  ): Promise<ApiResponse<any> & { conflicts?: Array<{ appointmentId: string; reason: string }> }> {
+    try {
+      const response = await apiClient.post(`/appointments/finalize-for-billing`, payload)
+      return response.data
+    } catch (err: unknown) {
+      const recovered = recoverAppointmentMutationFromAxiosError(err)
+      if (recovered) return recovered as ApiResponse<any> & { conflicts?: any[] }
+      throw err
+    }
+  }
+}
+
+export class BookingsAPI {
+  static async create(data: {
+    clientId: string
+    type: 'single' | 'multi_day' | 'package'
+    paymentMode?: string
+    paymentState?: string
+    /** When true (e.g. multi-day package + payment collected at booking), appointments get prepaidAtBooking */
+    packagePaymentCollected?: boolean
+    packagePurchaseId?: string
+    units: Array<{
+      serviceId: string
+      staffId?: string
+      staffAssignments?: Array<{ staffId: string; percentage: number; role?: string }>
+      startAt: string
+      endAt: string
+      price?: number
+      notes?: string
+      additionalServiceIds?: string[]
+    }>
+  }): Promise<
+    ApiResponse<{
+      bookingId: string
+      appointmentIds: string[]
+      bookingGroupId: string
+      timezone?: string
+    }>
+  > {
+    const response = await apiClient.post('/bookings', data)
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/bookings/${id}`)
+    return response.data
+  }
+}
+
+export class PackagesAPI {
+  static async list(params?: {
+    status?: string
+    search?: string
+    page?: number
+    limit?: number
+  }): Promise<
+    ApiResponse<{
+      packages: Array<{
+        _id: string
+        name: string
+        type: string
+        total_price: number
+        total_sittings: number
+        validity_days?: number | null
+        status: string
+        service_count?: number
+      }>
+      total: number
+      page: number
+      limit: number
+    }>
+  > {
+    const response = await apiClient.get('/packages', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<
+    ApiResponse<{
+      _id: string
+      name: string
+      description?: string
+      type: string
+      total_price: number
+      total_sittings: number
+      validity_days?: number | null
+      min_service_count?: number
+      services?: Array<{
+        service_id: { _id: string; name: string; price?: number; category?: string } | string
+        is_optional?: boolean
+        tag?: string
+      }>
+    }>
+  > {
+    const response = await apiClient.get(`/packages/${id}`)
+    return response.data
+  }
+
+  static async create(data: {
+    name: string
+    description?: string
+    type: "FIXED" | "CUSTOMIZED"
+    total_price: number
+    total_sittings: number
+    validity_days?: number | null
+    min_service_count?: number
+    services: Array<{ service_id: string; is_optional?: boolean; tag?: string }>
+  }): Promise<
+    ApiResponse<{
+      package: { _id: string; name: string }
+      warning?: string | null
+    }>
+  > {
+    const response = await apiClient.post("/packages", data)
+    return response.data
+  }
+
+  static async update(
+    id: string,
+    data: {
+      name: string
+      description?: string
+      type: "FIXED" | "CUSTOMIZED"
+      total_price: number
+      total_sittings: number
+      validity_days?: number | null
+      min_service_count?: number
+      services: Array<{ service_id: string; is_optional?: boolean; tag?: string }>
+    }
+  ): Promise<ApiResponse<{ _id: string; name: string }>> {
+    const response = await apiClient.put(`/packages/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse<null>> {
+    const response = await apiClient.delete(`/packages/${id}`)
+    return response.data
+  }
+
+  static async sell(
+    packageId: string,
+    data: {
+      client_id: string
+      amount_paid?: number
+      sold_by_staff_id?: string
+    }
+  ): Promise<
+    ApiResponse<{
+      clientPackage: { _id: string; payment_status: string; remaining_sittings: number }
+      warning?: string | null
+    }>
+  > {
+    const response = await apiClient.post(`/packages/${packageId}/sell`, data)
+    return response.data
+  }
+
+  static async listSessions(clientPackageId: string): Promise<
+    ApiResponse<{
+      clientPackage: { _id: string; payment_status: string }
+      sessions: Array<{
+        _id: string
+        sessionNumber: number
+        status: string
+        appointmentId?: string | null
+      }>
+      totalSessions: number
+      remainingCount: number
+    }>
+  > {
+    const response = await apiClient.get(`/packages/client-packages/${clientPackageId}/sessions`)
+    return response.data
+  }
+
+  static async scheduleSession(
+    clientPackageId: string,
+    data: {
+      sessionNumber: number
+      serviceId: string
+      staffId: string
+      startAt: string
+      endAt: string
+      blockIfPendingPayment?: boolean
+    }
+  ): Promise<ApiResponse<{ appointmentIds?: string[]; bookingId?: string }>> {
+    const response = await apiClient.post(
+      `/packages/client-packages/${clientPackageId}/sessions/schedule`,
+      data
+    )
+    return response.data
+  }
+
+  static async getClientPackages(clientId: string): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get(`/packages/client/${clientId}`)
+    return response.data
+  }
+
+  static async getRedemptionHistory(clientPackageId: string): Promise<
+    ApiResponse<{
+      clientPackage: Record<string, unknown>
+      history: Array<{
+        _id: string
+        sitting_number: number
+        redeemed_at?: string
+        is_reversed?: boolean
+        services_redeemed?: Array<{ service_id: string; service_name?: string }>
+      }>
+    }>
+  > {
+    const response = await apiClient.get(`/packages/client-packages/${clientPackageId}/history`)
+    return response.data
+  }
+
+  static async redeem(
+    clientPackageId: string,
+    data: {
+      services: Array<{ service_id: string } | string>
+      redeemed_at_branch_id?: string
+    }
+  ): Promise<
+    ApiResponse<{
+      clientPackage: {
+        _id: string
+        remaining_sittings: number
+        used_sittings: number
+        status: string
+      }
+      redemption: { _id: string; sitting_number: number }
+    }>
+  > {
+    const response = await apiClient.post(`/packages/client-packages/${clientPackageId}/redeem`, data)
+    return response.data
+  }
+
+  static async getSalesReport(params?: { from?: string; to?: string; package_id?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/packages/reports/sales', { params })
+    return response.data
+  }
+
+  static async getUtilizationReport(): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/packages/reports/utilization')
+    return response.data
+  }
+
+  static async getExpiringReport(days?: number): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/packages/reports/expiring', { params: { days } })
+    return response.data
+  }
+
+  static async exportReport(data: { format: 'excel' | 'pdf'; reportType?: string; from?: string; to?: string }): Promise<Blob> {
+    const response = await apiClient.post('/packages/reports/export', data, { responseType: 'blob' })
+    return response.data
+  }
+}
+
+export class LeadsAPI {
+  static async getAll(params?: { 
+    page?: number; 
+    limit?: number; 
+    search?: string; 
+    status?: string; 
+    assignedStaffId?: string; 
+    source?: string;
+    startDate?: string;
+    endDate?: string;
+  }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/leads', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/leads/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/leads', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/leads/${id}`, data)
+    return response.data
+  }
+
+  static async updateStatus(id: string, status: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.patch(`/leads/${id}/status`, { status })
+    return response.data
+  }
+
+  static async convertToAppointment(id: string, appointmentData: {
+    date: string;
+    time: string;
+    staffId?: string;
+    staffAssignments?: Array<{ staffId: string; percentage: number; role?: string }>;
+    notes?: string;
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/leads/${id}/convert-to-appointment`, appointmentData)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/leads/${id}`)
+    return response.data
+  }
+
+  static async getActivities(id: string): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get(`/leads/${id}/activities`)
+    return response.data
+  }
+}
+
+export class StaffAPI {
+  static async getAll(params?: { page?: number; limit?: number; search?: string }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/staff', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/staff/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/staff', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/staff/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/staff/${id}`)
+    return response.data
+  }
+
+  static async changePassword(id: string, newPassword: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/staff/${id}/change-password`, { newPassword })
+    return response.data
+  }
+}
+
+export class StaffDirectoryAPI {
+  static async getAll(params?: { search?: string }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/staff-directory', { params })
+    return response.data
+  }
+}
+
+// ── Staff payroll, attendance & leave ───────────────────────────────────────
+
+export type PayrollPaymentMethod = 'cash' | 'upi' | 'bank' | 'wallet' | ''
+
+export interface PayrollRow {
+  recordId: string | null
+  staffId: string
+  staffName: string
+  role?: string
+  phone?: string
+  month: string
+  baseSalary: number
+  incentive: number
+  bonus: number
+  overtimePay?: number
+  latePenalty?: number
+  deductions: number
+  leaveDeduction?: number
+  unpaidLeaveDays?: number
+  advanceRecovery?: number
+  manualDeductions?: number
+  deductionNote: string
+  netPay: number
+  status: 'draft' | 'paid'
+  paidAt: string | null
+  paymentMethod: PayrollPaymentMethod
+  notes: string
+  computedIncentive?: number
+  profileBreakdown?: Array<{
+    profileId?: string
+    profileName?: string
+    profileType?: string
+    commission: number
+    revenue: number
+    itemCount: number
+  }>
+  saved: boolean
+}
+
+export interface PayrollTotals {
+  staffCount: number
+  baseSalary: number
+  incentive: number
+  bonus: number
+  overtimePay?: number
+  deductions: number
+  leaveDeduction?: number
+  advanceRecovery?: number
+  netPay: number
+  paidCount: number
+  paidNet: number
+  pendingNet: number
+}
+
+export interface PayrollPeriod {
+  month: string
+  periodLabel: string
+  payoutLabel?: string
+  rows: PayrollRow[]
+  totals: PayrollTotals
+}
+
+export interface PayrollAuditEntry {
+  id: string
+  action: string
+  performedByName: string
+  performedAt: string
+  changes: Array<{ field: string; oldValue: unknown; newValue: unknown }>
+}
+
+export class PayrollAPI {
+  static async getMonth(month: string): Promise<ApiResponse<PayrollPeriod>> {
+    const response = await apiClient.get('/payroll', { params: { month } })
+    return response.data
+  }
+
+  static async upsert(body: {
+    staffId: string
+    month: string
+    baseSalary?: number
+    incentive?: number
+    bonus?: number
+    overtimePay?: number
+    latePenalty?: number
+    manualDeductions?: number
+    deductionNote?: string
+    notes?: string
+  }): Promise<ApiResponse<PayrollRow>> {
+    const response = await apiClient.post('/payroll', body)
+    return response.data
+  }
+
+  static async setStatus(
+    recordId: string,
+    status: 'draft' | 'paid',
+    options?: { paymentMethod?: PayrollPaymentMethod; paidAt?: string }
+  ): Promise<ApiResponse<PayrollRow>> {
+    const response = await apiClient.patch(`/payroll/${recordId}/status`, {
+      status,
+      paymentMethod: options?.paymentMethod,
+      paidAt: options?.paidAt,
+    })
+    return response.data
+  }
+
+  static async delete(recordId: string): Promise<ApiResponse<null>> {
+    const response = await apiClient.delete(`/payroll/${recordId}`)
+    return response.data
+  }
+
+  static async getAudit(recordId: string): Promise<ApiResponse<PayrollAuditEntry[]>> {
+    const response = await apiClient.get(`/payroll/records/${recordId}/audit`)
+    return response.data
+  }
+
+  static async getCommissionBreakdown(
+    staffId: string,
+    month: string
+  ): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/payroll/staff/${staffId}/commission-breakdown`, {
+      params: { month },
+    })
+    return response.data
+  }
+}
+
+export type StaffAdvanceRecoveryFrom = 'current_cycle' | 'next_cycle'
+
+export interface StaffAdvanceRow {
+  id: string
+  staffId: string
+  staffName: string
+  amount: number
+  recoveredAmount: number
+  outstanding: number
+  installmentAmount: number
+  givenAt: string
+  recoveryFrom: StaffAdvanceRecoveryFrom
+  notes: string
+  status: 'active' | 'closed'
+}
+
+export type StaffAdvanceLogType = 'given' | 'recovery' | 'closed' | 'reversal' | 'adjustment'
+
+export interface StaffAdvanceLogEntry {
+  id: string
+  advanceId: string
+  staffId: string
+  staffName: string
+  type: StaffAdvanceLogType
+  amount: number
+  outstandingAfter: number
+  notes: string
+  payrollRecordId: string | null
+  payrollMonth: string
+  performedByName: string
+  createdAt: string
+}
+
+export class StaffAdvanceAPI {
+  static async list(params?: {
+    staffId?: string
+    status?: 'active' | 'closed'
+  }): Promise<ApiResponse<StaffAdvanceRow[]>> {
+    const response = await apiClient.get('/staff-advances', { params })
+    return response.data
+  }
+
+  static async create(body: {
+    staffId: string
+    amount: number
+    installmentAmount?: number
+    recoveryFrom?: StaffAdvanceRecoveryFrom
+    notes?: string
+    givenAt?: string
+  }): Promise<ApiResponse<StaffAdvanceRow>> {
+    const response = await apiClient.post('/staff-advances', body)
+    return response.data
+  }
+
+  static async update(
+    id: string,
+    body: {
+      amount?: number
+      installmentAmount?: number
+      recoveryFrom?: StaffAdvanceRecoveryFrom
+      notes?: string
+      givenAt?: string
+    }
+  ): Promise<ApiResponse<StaffAdvanceRow>> {
+    const response = await apiClient.patch(`/staff-advances/${id}`, body)
+    return response.data
+  }
+
+  static async close(id: string): Promise<ApiResponse<{ id: string; status: string }>> {
+    const response = await apiClient.patch(`/staff-advances/${id}/close`)
+    return response.data
+  }
+
+  static async logs(advanceId: string): Promise<ApiResponse<StaffAdvanceLogEntry[]>> {
+    const response = await apiClient.get(`/staff-advances/${advanceId}/logs`)
+    return response.data
+  }
+}
+
+export interface StaffAttendanceRow {
+  id: string
+  staffId: string
+  staffName: string
+  date: string
+  checkInAt: string
+  checkOutAt: string | null
+  checkInByName?: string
+  checkOutByName?: string
+  status: 'checked_in' | 'completed'
+  dayStatus?: 'present' | 'late' | 'half_day' | 'absent'
+  lateMinutes?: number
+  workedHours?: number
+  overtimeMinutes?: number
+}
+
+export class StaffAttendanceAPI {
+  static async list(params?: {
+    staffId?: string
+    date?: string
+    startDate?: string
+    endDate?: string
+  }): Promise<ApiResponse<StaffAttendanceRow[]>> {
+    const response = await apiClient.get('/staff-attendance', { params })
+    return response.data
+  }
+
+  static async checkIn(body: {
+    staffId?: string
+    date?: string
+  }): Promise<ApiResponse<StaffAttendanceRow>> {
+    const response = await apiClient.post('/staff-attendance/check-in', body)
+    return response.data
+  }
+
+  static async checkOut(body: {
+    staffId?: string
+    date?: string
+  }): Promise<ApiResponse<StaffAttendanceRow>> {
+    const response = await apiClient.post('/staff-attendance/check-out', body)
+    return response.data
+  }
+
+  static async remove(id: string): Promise<ApiResponse<{ id: string }>> {
+    const response = await apiClient.delete(`/staff-attendance/${id}`)
+    return response.data
+  }
+
+  static async undoCheckOut(id: string): Promise<ApiResponse<StaffAttendanceRow>> {
+    const response = await apiClient.post(`/staff-attendance/${id}/undo-checkout`)
+    return response.data
+  }
+}
+
+export interface StaffLeaveRow {
+  id: string
+  staffId: string
+  staffName: string
+  date: string
+  type: 'unpaid' | 'paid' | 'half_day'
+  reason: string
+  fromBalance?: boolean
+  balanceDaysUsed?: number
+}
+
+export interface StaffLeaveSummaryRow {
+  staffId: string
+  staffName: string
+  unpaidDays: number
+  halfDays: number
+  paidDays: number
+  lwpDays: number
+  totalDays: number
+  entries: number
+  savedLeaveBalance: number
+  earnedInPeriod: number
+  usedInPeriod: number
+}
+
+export class StaffLeaveAPI {
+  static async list(params?: {
+    staffId?: string
+    month?: string
+    from?: string
+    to?: string
+  }): Promise<ApiResponse<StaffLeaveRow[]>> {
+    const response = await apiClient.get('/staff-leaves', { params })
+    return response.data
+  }
+
+  static async summary(params?: {
+    staffId?: string
+    month?: string
+    from?: string
+    to?: string
+  }): Promise<ApiResponse<StaffLeaveSummaryRow[]>> {
+    const response = await apiClient.get('/staff-leaves/summary', { params })
+    return response.data
+  }
+
+  static async upsert(body: {
+    staffId: string
+    date: string
+    type: StaffLeaveRow['type']
+    reason?: string
+    useBalance?: boolean
+  }): Promise<ApiResponse<StaffLeaveRow>> {
+    const response = await apiClient.post('/staff-leaves', body)
+    return response.data
+  }
+
+  static async remove(id: string): Promise<ApiResponse<{ deleted: boolean }>> {
+    const response = await apiClient.delete(`/staff-leaves/${id}`)
+    return response.data
+  }
+}
+
+export interface StaffLeaveCreditBalanceRow {
+  staffId: string
+  staffName: string
+  balance: number
+  earnedInPeriod: number
+  usedInPeriod: number
+}
+
+export interface StaffLeaveCreditLedgerRow {
+  id: string
+  staffId: string
+  staffName: string
+  date: string
+  direction: 'earn' | 'use'
+  days: number
+  kind: string
+  reason: string
+  leaveRecordId: string | null
+  createdAt: string
+}
+
+export class StaffLeaveCreditAPI {
+  static async balances(params?: {
+    staffId?: string
+    month?: string
+    from?: string
+    to?: string
+  }): Promise<ApiResponse<StaffLeaveCreditBalanceRow[]>> {
+    const response = await apiClient.get('/staff-leave-credits/balances', { params })
+    return response.data
+  }
+
+  static async ledger(params?: {
+    staffId?: string
+    month?: string
+    from?: string
+    to?: string
+  }): Promise<ApiResponse<StaffLeaveCreditLedgerRow[]>> {
+    const response = await apiClient.get('/staff-leave-credits/ledger', { params })
+    return response.data
+  }
+
+  static async sync(body: {
+    month?: string
+    from?: string
+    to?: string
+    staffId?: string
+    reason?: string
+  }): Promise<ApiResponse<{ created: number; skipped?: number }>> {
+    const response = await apiClient.post('/staff-leave-credits/sync', body)
+    return response.data
+  }
+
+  static async adjust(body: {
+    staffId: string
+    date: string
+    days: number
+    direction: 'earn' | 'use'
+    kind?: string
+    reason?: string
+  }): Promise<ApiResponse<{ balance: number }>> {
+    const response = await apiClient.post('/staff-leave-credits/adjust', body)
+    return response.data
+  }
+}
+
+export class BlockTimeAPI {
+  static async getAll(params?: { staffId?: string; startDate?: string; endDate?: string }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/block-time', { params })
+    return response.data
+  }
+
+  static async create(data: {
+    staffId: string
+    title: string
+    startDate: string
+    startTime: string
+    endTime: string
+    recurringFrequency?: string
+    endDate?: string | null
+    description?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/block-time', data)
+    return response.data
+  }
+
+  static async update(
+    id: string,
+    data: {
+      title?: string
+      startDate?: string
+      startTime?: string
+      endTime?: string
+      recurringFrequency?: string
+      endDate?: string | null
+      description?: string
+    }
+  ): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/block-time/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse<void>> {
+    const response = await apiClient.delete(`/block-time/${id}`)
+    return response.data
+  }
+}
+
+export class ReceiptsAPI {
+  static async getAll(params?: { page?: number; limit?: number; clientId?: string; date?: string }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/receipts', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/receipts/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/receipts', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/receipts/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/receipts/${id}`)
+    return response.data
+  }
+
+  static async getByClient(clientId: string): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get(`/receipts/client/${clientId}`)
+    return response.data
+  }
+}
+
+export interface SalesListResponse extends ApiResponse<any[]> {
+  total?: number
+  page?: number
+  limit?: number
+  totalPages?: number
+}
+
+export interface SalesSummaryData {
+  /** Top-line bill (services + products) before discounts/loyalty; excludes tips. */
+  grossRevenue: number
+  /** Final bill after discounts, loyalty, and returns; excludes tips. */
+  netRevenue: number
+  /** Same as `netRevenue` (sum of `grossTotal`). Kept for backward compatibility. */
+  totalRevenue: number
+  cashCollected: number
+  serviceCashCollected?: number
+  walletCashCollected?: number
+  onlineCash: number
+  cardCollected?: number
+  onlinePayCollected?: number
+  unpaidValue: number
+  tips: number
+  tipsCash?: number
+  tipsCard?: number
+  tipsOnline?: number
+  completedSales: number
+  partialSales: number
+  unpaidSales: number
+}
+
+export class SalesAPI {
+  static async getAll(params?: {
+    page?: number
+    limit?: number
+    search?: string
+    dateFrom?: string
+    dateTo?: string
+    date?: string
+    status?: string
+    paymentMode?: string
+    tipStaffId?: string
+    /** When "1"/"true", API matches invoice date OR paymentHistory date (cash register / dues). */
+    includeDuePaymentDates?: string | boolean
+    forCashRegister?: string | boolean
+  }): Promise<SalesListResponse> {
+    const response = await apiClient.get('/sales', { params })
+    return response.data
+  }
+
+  /**
+   * Loads all rows matching the same filters as getAll by paging (default batch 500).
+   * Prefer this over a single huge limit=10000 request to avoid slow DB/response times.
+   *
+   * Note: pages are fetched sequentially (N round-trips for large datasets). Screens that only
+   * need aggregates (e.g. YTD revenue by month, staff performance totals) should eventually use
+   * dedicated server-side aggregation endpoints instead of pulling every sale row.
+   */
+  static async getAllMergePages(params?: {
+    batchSize?: number
+    search?: string
+    dateFrom?: string
+    dateTo?: string
+    date?: string
+    status?: string
+    paymentMode?: string
+    tipStaffId?: string
+    includeDuePaymentDates?: string | boolean
+    forCashRegister?: string | boolean
+  }): Promise<any[]> {
+    const batchSize = Math.min(Math.max(params?.batchSize ?? 500, 1), 1000)
+    const { batchSize: _omit, ...rest } = { ...(params || {}) }
+    const first = await SalesAPI.getAll({
+      ...rest,
+      page: 1,
+      limit: batchSize,
+    })
+    const rows: any[] = Array.isArray(first.data) ? [...first.data] : []
+    const total = typeof first.total === 'number' ? first.total : rows.length
+    if (total === 0) return rows
+    const totalPages =
+      typeof first.totalPages === 'number' && first.totalPages > 0
+        ? first.totalPages
+        : Math.ceil(total / batchSize)
+
+    for (let page = 2; page <= totalPages; page++) {
+      const res = await SalesAPI.getAll({
+        ...rest,
+        page,
+        limit: batchSize,
+      })
+      if (Array.isArray(res.data) && res.data.length) rows.push(...res.data)
+    }
+    return rows
+  }
+
+  /** Aggregate totals for filters (no row payload). Same query params as getAll except page/limit are ignored. */
+  static async getSummary(params?: {
+    search?: string
+    dateFrom?: string
+    dateTo?: string
+    date?: string
+    status?: string
+    paymentMode?: string
+    tipStaffId?: string
+    includeDuePaymentDates?: string | boolean
+    forCashRegister?: string | boolean
+  }): Promise<ApiResponse<SalesSummaryData>> {
+    const response = await apiClient.get('/sales/summary', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/sales/${id}`)
+    return response.data
+  }
+
+  static async getByClient(clientPhone: string): Promise<ApiResponse<any[]> & { shared?: boolean }> {
+    const encoded = encodeURIComponent(clientPhone || '')
+    const response = await apiClient.get(`/sales/by-phone/${encoded}`)
+    return response.data
+  }
+
+  static async getByBillNo(billNo: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/sales/bill/${billNo}`)
+    return response.data
+  }
+
+  static async getConsumptionPreview(saleId: string): Promise<ApiResponse<{
+    saleId: string
+    billNo: string
+    status: string
+    priorLogs: Array<{
+      id: string
+      productId: string
+      productName: string
+      quantityConsumed: number
+      unit: string
+      source: string
+      createdAt?: string
+      notes?: string
+    }>
+  }>> {
+    const response = await apiClient.get(`/sales/${saleId}/consumption-preview`)
+    return response.data
+  }
+
+  static async recordConsumption(
+    saleId: string,
+    body: {
+      entries: Array<{ productId: string; quantity: number; notes?: string }>
+      notes?: string
+    }
+  ): Promise<ApiResponse<{ recordedCount: number; warnings: string[] }>> {
+    const response = await apiClient.post(`/sales/${saleId}/consumption`, body)
+    return response.data
+  }
+
+  static async getByAppointmentId(appointmentId: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/sales/by-appointment/${appointmentId}`)
+    return response.data
+  }
+
+  static async getByBillNoPublic(billNo: string, token: string): Promise<ApiResponse<any> & { businessSettings?: any; feedbackEligibility?: any }> {
+    const publicClient = axios.create({
+      baseURL: API_BASE_URL,
+      timeout: 10000,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
+    const response = await publicClient.get(`/public/sales/bill/${billNo}/${token}`)
+    return response.data
+  }
+
+  /** Public: submit feedback using invoice billNo + shareToken */
+  static async submitInvoiceFeedbackPublic(
+    billNo: string,
+    shareToken: string,
+    body: { rating: number; reviewText?: string }
+  ): Promise<ApiResponse<any>> {
+    const publicClient = axios.create({
+      baseURL: API_BASE_URL,
+      timeout: 20000,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
+    const response = await publicClient.post(
+      `/public/sales/bill/${encodeURIComponent(billNo)}/${encodeURIComponent(shareToken)}/feedback`,
+      { ...body, source: 'invoice_page' }
+    )
+    return response.data
+  }
+
+  /** Public: AI-style draft comment for invoice feedback modal (rating + receipt context). */
+  static async suggestInvoiceFeedbackPublic(
+    billNo: string,
+    shareToken: string,
+    body: { rating: number }
+  ): Promise<ApiResponse<{ text: string; source?: 'openai' | 'anthropic' | 'template' }>> {
+    const publicClient = axios.create({
+      baseURL: API_BASE_URL,
+      timeout: 20000,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
+    const response = await publicClient.post(
+      `/public/sales/bill/${encodeURIComponent(billNo)}/${encodeURIComponent(shareToken)}/suggest-feedback`,
+      body
+    )
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/sales', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/sales/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string, reason?: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.delete(`/sales/${id}`, reason ? { data: { reason } } : undefined)
+    return response.data
+  }
+
+  // Exchange products within a sale (bill)
+  static async exchangeProducts(
+    saleId: string,
+    data: any
+  ): Promise<ApiResponse<any>> {
+    if (!saleId || saleId.trim() === '') {
+      return {
+        success: false,
+        error: 'Sale ID is required for product exchange',
+        data: undefined as any
+      }
+    }
+    console.log(`Calling POST /sales/${saleId}/exchange`)
+    const response = await apiClient.post(`/sales/${saleId}/exchange`, data)
+    return response.data
+  }
+
+  // Add payment to a sale
+  static async addPayment(saleId: string, paymentData: {
+    amount: number
+    method: string
+    notes?: string
+    collectedBy?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/sales/${saleId}/payment`, paymentData)
+    return response.data
+  }
+
+  // Get payment summary for a sale
+  static async getPaymentSummary(saleId: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/sales/${saleId}/payment-summary`)
+    return response.data
+  }
+
+  // Get unpaid/overdue bills
+  static async getUnpaidBills(params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/sales/unpaid/overdue', { params })
+    return response.data
+  }
+}
+
+export class MembershipAPI {
+  static async getPlans(params?: { isActive?: boolean }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/membership/plans', { params })
+    return response.data
+  }
+
+  static async getSubscriptions(params?: {
+    planId?: string
+    search?: string
+    /** ALL | ACTIVE (valid) | EXPIRED | CANCELLED */
+    status?: string
+    /** ISO range — filters by membership startDate */
+    dateFrom?: string
+    dateTo?: string
+    page?: number
+    limit?: number
+  }): Promise<
+    ApiResponse<any[]> & {
+      total?: number
+      page?: number
+      limit?: number
+      totalPages?: number
+      totalRevenue?: number
+    }
+  > {
+    const response = await apiClient.get('/membership/subscriptions', { params })
+    return response.data
+  }
+
+  static async createPlan(data: {
+    planName: string
+    price: number
+    durationInDays: number
+    discountPercentage?: number
+    includedServices?: Array<{ serviceId: string; usageLimit: number }>
+    isActive?: boolean
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/membership/plans', data)
+    return response.data
+  }
+
+  static async updatePlan(id: string, data: Partial<{
+    planName: string
+    price: number
+    durationInDays: number
+    discountPercentage: number
+    includedServices: Array<{ serviceId: string; usageLimit: number }>
+    isActive: boolean
+  }>): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/membership/plans/${id}`, data)
+    return response.data
+  }
+
+  static async togglePlan(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.patch(`/membership/plans/${id}/toggle`)
+    return response.data
+  }
+
+  static async subscribe(data: { customerId: string; planId: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/membership/subscribe', data)
+    return response.data
+  }
+
+  static async getByCustomer(
+    customerId: string,
+    params?: { asOfDate?: string }
+  ): Promise<ApiResponse<{
+    subscription: any
+    plan: any
+    usageSummary: Array<{ serviceId: string; serviceName: string; used: number; limit: number; remaining: number }>
+    /** Sum of remaining free included-service uses across the plan */
+    freeServicesRemaining?: number
+    /** Estimated savings from membership-free service lines on bills (list price × qty) */
+    totalSavedViaMembership?: number
+  }>> {
+    const response = await apiClient.get(`/membership/customer/${customerId}`, { params })
+    return response.data
+  }
+
+  static async redeem(data: {
+    customerId: string
+    serviceId: string
+    staffId: string
+    billingId: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/membership/redeem', data)
+    return response.data
+  }
+}
+
+export class ExpensesAPI {
+  static async getAll(params?: { page?: number; limit?: number; search?: string; dateFrom?: string; dateTo?: string; category?: string; paymentMethod?: string }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/expenses', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/expenses/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/expenses', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/expenses/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/expenses/${id}`)
+    return response.data
+  }
+}
+
+export class UsersAPI {
+  static async getAll(params?: { page?: number; limit?: number; search?: string }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/users', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/users/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/users', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/users/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string): Promise<ApiResponse> {
+    const response = await apiClient.delete(`/users/${id}`)
+    return response.data
+  }
+
+  static async getPermissions(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/users/${id}/permissions`)
+    return response.data
+  }
+
+  static async updatePermissions(id: string, permissions: any[]): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/users/${id}/permissions`, { permissions })
+    return response.data
+  }
+
+  static async changePassword(id: string, newPassword: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/users/${id}/change-password`, { newPassword })
+    return response.data
+  }
+
+  static async verifyAdminPassword(id: string, password: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/users/${id}/verify-admin-password`, { password })
+    return response.data
+  }
+}
+
+export class ReportsAPI {
+  static async exportProducts(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/products', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async exportSales(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/sales', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async exportServiceList(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/service-list', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async exportProductList(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/product-list', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async exportStaffPerformance(format: 'pdf' | 'xlsx', filters?: any, data?: any[]): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/staff-performance', {
+      format,
+      filters,
+      data: data || []
+    });
+    return response.data;
+  }
+
+  static async exportServices(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/services', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async exportClients(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/clients', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async exportExpenses(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/expenses', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async exportCashRegistry(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/cash-registry', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async getRevenueReport(params?: { startDate?: string; endDate?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/reports/revenue', { params })
+    return response.data
+  }
+
+  static async getSupplierReport(params?: { dateFrom?: string; dateTo?: string }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/reports/supplier', { params })
+    return response.data
+  }
+
+  static async getPurchaseReport(params?: { dateFrom?: string; dateTo?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/reports/purchase', { params })
+    return response.data
+  }
+
+  static async exportSummary(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/summary', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async getAppointmentList(params?: { dateFrom?: string; dateTo?: string; dateFilterType?: string; status?: string; showWalkIn?: boolean }): Promise<ApiResponse<any> & { data: any[]; summary: { count: number; totalValue: number } }> {
+    const response = await apiClient.get('/reports/appointment-list', { params });
+    return response.data;
+  }
+
+  static async exportAppointmentList(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/appointment-list', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async getUnpaidPartPaid(params?: { dateFrom?: string; dateTo?: string; status?: string }): Promise<ApiResponse<any> & { data: any[]; summary: { count: number; totalOutstanding: number; totalDuesSettled?: number } }> {
+    const response = await apiClient.get('/reports/unpaid-part-paid', { params });
+    return response.data;
+  }
+
+  static async exportUnpaidPartPaid(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/unpaid-part-paid', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async getDeletedInvoices(params?: { date?: string; dateFrom?: string; dateTo?: string }): Promise<ApiResponse<any> & { data: any[]; summary: { count: number; totalValue: number } }> {
+    const response = await apiClient.get('/reports/deleted-invoices', { params });
+    return response.data;
+  }
+
+  static async exportDeletedInvoices(format: 'pdf' | 'xlsx', filters?: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/export/deleted-invoices', {
+      format,
+      filters
+    });
+    return response.data;
+  }
+
+  static async getSummary(params?: { dateFrom?: string; dateTo?: string }): Promise<ApiResponse<{
+    totalBillCount: number
+    totalCustomerCount: number
+    totalSales: number
+    totalSalesCash: number
+    totalSalesOnline: number
+    totalSalesCard: number
+    totalSalesWallet?: number
+    totalSalesRewardPoint?: number
+    duesCollected: number
+    cashExpense: number
+    tipCollected: number
+    cashAddedToWallet?: number
+    cashBalance: number
+    totalDue?: number
+    customersWithDue?: number
+  }>> {
+    const response = await apiClient.get('/reports/summary', { params })
+    return response.data
+  }
+
+  static async getServicePopularity(params?: { startDate?: string; endDate?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/reports/services', { params })
+    return response.data
+  }
+
+  static async getClientRetention(params?: { startDate?: string; endDate?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/reports/clients', { params })
+    return response.data
+  }
+
+  static async getDashboardStats(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/reports/dashboard')
+    return response.data
+  }
+
+  static async getTipPayouts(params?: { dateFrom?: string; dateTo?: string }): Promise<ApiResponse<{ data: any[] }>> {
+    const response = await apiClient.get('/reports/tip-payouts', { params })
+    return response.data
+  }
+
+  static async createTipPayout(body: { staffId: string; staffName: string; amount: number; dateFrom?: string; dateTo?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/reports/tip-payouts', body)
+    return response.data
+  }
+}
+
+export class DashboardAPI {
+  static async getInit(params?: {
+    chartRange?: "year" | "last7days" | "last30days"
+    metricsRange?: "today" | "last7days"
+    appointmentsRange?: "today" | "next7days"
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get("/dashboard/init", { params })
+    return response.data
+  }
+}
+
+export interface NotificationFeedItem {
+  id: string
+  type: string
+  title: string
+  body: string
+  /** Changes when underlying counts shift; client dismissal is scoped to id+fingerprint so alerts return after updates. */
+  fingerprint: string
+  href: string
+  severity: "warning" | "info"
+  at: string
+}
+
+export interface WebsiteEnquiryNotificationItem {
+  id: string
+  type: string
+  typeLabel: string
+  name: string
+  phone: string
+  summary: string
+  createdAt: string | null
+  href: string
+}
+
+export class NotificationsAPI {
+  static async getFeed(): Promise<
+    ApiResponse<{ items: NotificationFeedItem[] }>
+  > {
+    const response = await apiClient.get("/notifications/feed")
+    return response.data
+  }
+
+  static async getWebsiteEnquiries(): Promise<
+    ApiResponse<{ items: WebsiteEnquiryNotificationItem[] }>
+  > {
+    const response = await apiClient.get("/notifications/website-enquiries")
+    return response.data
+  }
+}
+
+export class AnalyticsAPI {
+  static async getRevenueTab(params?: {
+    dateFrom?: string
+    dateTo?: string
+    bucket?: "day" | "week" | "month"
+  }): Promise<ApiResponse<AnalyticsRevenueTabData>> {
+    const response = await apiClient.get("/analytics/revenue", { params })
+    return response.data
+  }
+
+  static async getServicesTab(params?: {
+    dateFrom?: string
+    dateTo?: string
+    bucket?: "day" | "week" | "month"
+  }): Promise<ApiResponse<AnalyticsServicesTabData>> {
+    const response = await apiClient.get("/analytics/services", { params })
+    return response.data
+  }
+
+  static async getClientsTab(params?: {
+    dateFrom?: string
+    dateTo?: string
+    bucket?: "day" | "week" | "month"
+  }): Promise<ApiResponse<AnalyticsClientsTabData>> {
+    const response = await apiClient.get("/analytics/clients", { params })
+    return response.data
+  }
+
+  static async getProductsTab(params?: {
+    dateFrom?: string
+    dateTo?: string
+    bucket?: "day" | "week" | "month"
+  }): Promise<ApiResponse<AnalyticsProductsTabData>> {
+    const response = await apiClient.get("/analytics/products", { params })
+    return response.data
+  }
+
+  static async getStaffTab(params?: {
+    dateFrom?: string
+    dateTo?: string
+    bucket?: "day" | "week" | "month"
+    lineType?: "all" | "service" | "product" | "membership"
+  }): Promise<ApiResponse<AnalyticsStaffTabData>> {
+    const response = await apiClient.get("/analytics/staff", { params })
+    return response.data
+  }
+
+  static async getStaffTrends(
+    staffId: string,
+    params?: {
+      dateFrom?: string
+      dateTo?: string
+      bucket?: "day" | "week" | "month"
+      lineType?: "all" | "service" | "product" | "membership"
+    }
+  ): Promise<ApiResponse<AnalyticsStaffDrillDownData>> {
+    const response = await apiClient.get(`/analytics/staff/${encodeURIComponent(staffId)}/trends`, { params })
+    return response.data
+  }
+}
+
+export class BusinessAPI {
+  static async getInfo(): Promise<
+    ApiResponse<{
+      name?: string
+      address?: { street?: string; city?: string; state?: string; zipCode?: string }
+      contact?: { phone?: string; email?: string }
+    }>
+  > {
+    const response = await apiClient.get('/business/info')
+    return response.data
+  }
+}
+
+export class SettingsAPI {
+  static async getGeneralSettings(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/settings/general')
+    return response.data
+  }
+
+  static async updateGeneralSettings(data: { receiptPaperSize: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.put('/settings/general', data)
+    return response.data
+  }
+
+  static async getBusinessSettings(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/settings/business')
+    return response.data
+  }
+
+  static async updateBusinessSettings(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put('/settings/business', data)
+    return response.data
+  }
+
+  static async incrementReceiptNumber(): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/settings/business/increment-receipt')
+    return response.data
+  }
+
+  static async getPOSSettings(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/settings/pos')
+    return response.data
+  }
+
+  static async updatePOSSettings(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put('/settings/pos', data)
+    return response.data
+  }
+
+  static async resetReceiptSequence(): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/settings/pos/reset-sequence')
+    return response.data
+  }
+
+  static async getReceiptTemplate(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/settings/receipt-template')
+    return response.data
+  }
+
+  static async updateReceiptTemplate(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put('/settings/receipt-template', data)
+    return response.data
+  }
+
+  static async getAppointmentSettings(): Promise<ApiResponse<AppointmentSettingsData>> {
+    const response = await apiClient.get('/settings/appointments')
+    return response.data
+  }
+
+  static async updateAppointmentSettings(
+    data: AppointmentSettingsUpdatePayload
+  ): Promise<ApiResponse<AppointmentSettingsData>> {
+    const response = await apiClient.put('/settings/appointments', data)
+    return response.data
+  }
+
+  static async getPaymentSettings(): Promise<ApiResponse<PaymentSettingsData>> {
+    const response = await apiClient.get('/settings/payment')
+    return response.data
+  }
+
+  static async updatePaymentSettings(
+    data: PaymentSettingsUpdatePayload
+  ): Promise<ApiResponse<PaymentSettingsData>> {
+    const response = await apiClient.put('/settings/payment', data)
+    return response.data
+  }
+}
+
+export interface HolidayRow {
+  id: string
+  date: string
+  name: string
+}
+
+/**
+ * Client segment threshold rules (CRM filters).
+ */
+export class ClientSegmentRulesAPI {
+  static async get(): Promise<
+    ApiResponse<{
+      newMaxVisits: number
+      vipSpendThreshold: number
+      atRiskAfterDays: number
+      winBackAfterDays: number
+    }>
+  > {
+    const response = await apiClient.get('/settings/client-segments')
+    return response.data
+  }
+
+  static async update(data: {
+    newMaxVisits: number
+    vipSpendThreshold: number
+    atRiskAfterDays: number
+    winBackAfterDays: number
+  }): Promise<
+    ApiResponse<{
+      newMaxVisits: number
+      vipSpendThreshold: number
+      atRiskAfterDays: number
+      winBackAfterDays: number
+    }>
+  > {
+    const response = await apiClient.put('/settings/client-segments', data)
+    return response.data
+  }
+}
+
+/**
+ * Attendance & Payroll business settings + branch holidays.
+ * Server-side settings shape is treated as `any` on the client so we can
+ * ship UI updates ahead of a strict type without breaking callers.
+ */
+export class AttendancePayrollSettingsAPI {
+  static async get(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/settings/attendance-payroll')
+    return response.data
+  }
+
+  static async update(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put('/settings/attendance-payroll', data)
+    return response.data
+  }
+
+  static async listHolidays(year?: number | string): Promise<ApiResponse<HolidayRow[]>> {
+    const params = year ? { params: { year: String(year) } } : undefined
+    const response = await apiClient.get('/settings/holidays', params)
+    return response.data
+  }
+
+  static async saveHoliday(payload: { date: string; name?: string }): Promise<ApiResponse<HolidayRow>> {
+    const response = await apiClient.post('/settings/holidays', payload)
+    return response.data
+  }
+
+  static async deleteHoliday(id: string): Promise<ApiResponse<null>> {
+    const response = await apiClient.delete(`/settings/holidays/${id}`)
+    return response.data
+  }
+}
+
+export class GmbAPI {
+  static async connect(): Promise<ApiResponse<{ authUrl: string }>> {
+    const response = await apiClient.get('/gmb/connect')
+    return response.data
+  }
+
+  static async disconnect(): Promise<ApiResponse<any>> {
+    const response = await apiClient.delete('/gmb/disconnect')
+    return response.data
+  }
+
+  static async getStatus(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/gmb/status')
+    return response.data
+  }
+
+  static async getAccounts(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/gmb/accounts')
+    return response.data
+  }
+
+  static async mapLocation(data: {
+    accountId: string
+    locationId: string
+    locationName?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.put('/gmb/location', data)
+    return response.data
+  }
+
+  static async getReviews(params?: Record<string, string>): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/gmb/reviews', { params })
+    return response.data
+  }
+
+  static async replyToReview(reviewId: string, replyText: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/gmb/reviews/${encodeURIComponent(reviewId)}/reply`, { replyText })
+    return response.data
+  }
+
+  static async generateAiDraft(reviewId: string): Promise<ApiResponse<{ draft: string }>> {
+    const response = await apiClient.post(`/gmb/reviews/${encodeURIComponent(reviewId)}/ai-draft`)
+    return response.data
+  }
+
+  static async getHealth(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/gmb/health')
+    return response.data
+  }
+
+  static async getInsights(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/gmb/insights')
+    return response.data
+  }
+
+  static async updateSettings(data: Record<string, unknown>): Promise<ApiResponse<any>> {
+    const response = await apiClient.put('/gmb/settings', data)
+    return response.data
+  }
+
+  static async syncServices(): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/gmb/sync/services')
+    return response.data
+  }
+
+  static async syncHours(regularHours: unknown): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/gmb/sync/hours', { regularHours })
+    return response.data
+  }
+
+  static async getConversionReport(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/gmb/conversion-report')
+    return response.data
+  }
+
+  static async getAdTriggers(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/gmb/ad-triggers')
+    return response.data
+  }
+
+  static async approveAdTrigger(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/gmb/ad-triggers/${encodeURIComponent(id)}/approve`)
+    return response.data
+  }
+}
+
+export class FeedbackAPI {
+  static async getStats(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/feedback/stats/summary')
+    return response.data
+  }
+
+  static async getBranches(): Promise<ApiResponse<{ id: string }[]>> {
+    const response = await apiClient.get('/feedback/branches')
+    return response.data
+  }
+
+  static async list(params: Record<string, string | number | undefined>): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/feedback', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/feedback/${encodeURIComponent(id)}`)
+    return response.data
+  }
+
+  static async updateStatus(id: string, status: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.patch(`/feedback/${encodeURIComponent(id)}/status`, { status })
+    return response.data
+  }
+
+  static async updateNotes(id: string, internalNotes: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.patch(`/feedback/${encodeURIComponent(id)}/notes`, { internalNotes })
+    return response.data
+  }
+}
+
+export class CashRegistryAPI {
+  static async getAll(params?: { 
+    page?: number; 
+    limit?: number; 
+    dateFrom?: string; 
+    dateTo?: string; 
+    shiftType?: string; 
+    search?: string 
+  }): Promise<PaginatedResponse<any>> {
+    const response = await apiClient.get('/cash-registry', { params })
+    return response.data
+  }
+
+  static async getById(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/cash-registry/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/cash-registry', data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/cash-registry/${id}`, data)
+    return response.data
+  }
+
+  static async delete(id: string, shiftType?: string): Promise<ApiResponse> {
+    // For now, just delete by ID without shiftType parameter
+    // TODO: Implement proper shiftType handling when backend supports it
+    const response = await apiClient.delete(`/cash-registry/${id}`)
+    return response.data
+  }
+
+  static async verify(id: string, data: { 
+    verificationNotes?: string; 
+    balanceDifferenceReason?: string; 
+    balanceDifferenceNote?: string;
+    onlineCashDifferenceReason?: string;
+    onlineCashDifferenceNote?: string;
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/cash-registry/${id}/verify`, data)
+    const raw = response.data as ApiResponse<any> & { isVerified?: boolean; _id?: string }
+    if (raw && typeof raw === 'object' && 'success' in raw && raw.success !== undefined) {
+      return raw
+    }
+    return { success: true, data: raw } as ApiResponse<any>
+  }
+
+  static async updateDifferenceReason(id: string, data: { 
+    type: 'cash' | 'online'; 
+    reason: string; 
+    note?: string 
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.patch(`/cash-registry/${id}/difference-reason`, data)
+    return response.data
+  }
+
+  static async getDashboardSummary(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/cash-registry/summary/dashboard')
+    return response.data
+  }
+
+  static async getPettyCashSummary(date?: string): Promise<ApiResponse<{ totalAdditions: number; pettyCashExpenses: number; expectedBalance: number }>> {
+    const params = date ? { date } : {}
+    const response = await apiClient.get('/cash-registry/petty-cash-summary', { params })
+    return response.data
+  }
+}
+
+export class CashMovementsAPI {
+  static async getAll(params?: {
+    dateFrom?: string
+    dateTo?: string
+    status?: string
+  }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get('/cash-movements', { params })
+    return response.data
+  }
+
+  static async create(data: {
+    type: string
+    direction?: 'in' | 'out'
+    amount: number
+    date?: string
+    reason?: string
+    referenceNo?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/cash-movements', data)
+    return response.data
+  }
+
+  static async update(
+    id: string,
+    data: {
+      type: string
+      direction?: 'in' | 'out'
+      amount: number
+      date?: string
+      reason?: string
+      referenceNo?: string
+    }
+  ): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/cash-movements/${encodeURIComponent(id)}`, data)
+    return response.data
+  }
+
+  static async void(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.delete(`/cash-movements/${encodeURIComponent(id)}`)
+    return response.data
+  }
+}
+
+export class PettyCashAPI {
+  static async addBalance(amount: number, date?: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/petty-cash', { amount, date })
+    return response.data
+  }
+
+  static async getLogs(): Promise<ApiResponse<{ type: string; amount: number; date: string }[]>> {
+    const response = await apiClient.get('/petty-cash/logs')
+    return response.data
+  }
+}
+
+export class StaffPerformanceAPI {
+  // Get staff performance data with filtering options
+  static async getPerformanceData(params?: {
+    staffId?: string;
+    startDate?: string;
+    endDate?: string;
+    period?: 'today' | 'yesterday' | 'last7days' | 'last30days' | 'currentMonth' | 'all';
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/staff/performance', { params })
+    return response.data
+  }
+
+  // Get detailed performance metrics for a specific staff member
+  static async getStaffDetails(staffId: string, params?: {
+    startDate?: string;
+    endDate?: string;
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/staff/performance/${staffId}`, { params })
+    return response.data
+  }
+
+  // Get commission data for staff members
+  static async getCommissionData(params?: {
+    staffId?: string;
+    startDate?: string;
+    endDate?: string;
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/staff/commission', { params })
+    return response.data
+  }
+
+  // Update commission rates for a staff member
+  static async updateCommissionRates(staffId: string, data: {
+    serviceCommissionRate?: number;
+    productCommissionRate?: number;
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/staff/commission/${staffId}`, data)
+    return response.data
+  }
+
+  // Get staff performance summary (dashboard cards data)
+  static async getPerformanceSummary(params?: {
+    startDate?: string;
+    endDate?: string;
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/staff/performance/summary', { params })
+    return response.data
+  }
+
+  // Get staff sales analytics
+  static async getSalesAnalytics(params?: {
+    staffId?: string;
+    startDate?: string;
+    endDate?: string;
+    groupBy?: 'day' | 'week' | 'month';
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/staff/sales-analytics', { params })
+    return response.data
+  }
+
+  // Get customer retention data for staff
+  static async getCustomerRetention(params?: {
+    staffId?: string;
+    startDate?: string;
+    endDate?: string;
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/staff/customer-retention', { params })
+    return response.data
+  }
+
+  // Calculate commission for a specific sale
+  static async calculateCommission(data: {
+    staffId: string;
+    saleId: string;
+    serviceCommissionRate?: number;
+    productCommissionRate?: number;
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/staff/commission/calculate', data)
+    return response.data
+  }
+
+  // Get staff performance comparison
+  static async getPerformanceComparison(params?: {
+    staffIds?: string[];
+    startDate?: string;
+    endDate?: string;
+    metrics?: string[];
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/staff/performance/comparison', { params })
+    return response.data
+  }
+
+  // Export staff performance data
+  static async exportPerformanceData(params?: {
+    staffId?: string;
+    startDate?: string;
+    endDate?: string;
+    format?: 'pdf' | 'excel';
+  }): Promise<Blob> {
+    const response = await apiClient.get('/staff/performance/export', { 
+      params,
+      responseType: 'blob'
+    })
+    return response.data
+  }
+}
+
+export class CommissionProfileAPI {
+  static async getProfiles() {
+    try {
+      const response = await apiClient.get('/commission-profiles')
+      return response.data
+    } catch (error) {
+      console.error('Error fetching commission profiles:', error)
+      throw error
+    }
+  }
+
+  static async createProfile(data: any) {
+    try {
+      const response = await apiClient.post('/commission-profiles', data)
+      return response.data
+    } catch (error) {
+      console.error('Error creating commission profile:', error)
+      throw error
+    }
+  }
+
+  static async updateProfile(id: string, data: any) {
+    try {
+      const response = await apiClient.put(`/commission-profiles/${id}`, data)
+      return response.data
+    } catch (error) {
+      console.error('Error updating commission profile:', error)
+      throw error
+    }
+  }
+
+  static async deleteProfile(id: string) {
+    try {
+      const response = await apiClient.delete(`/commission-profiles/${id}`)
+      return response.data
+    } catch (error) {
+      console.error('Error deleting commission profile:', error)
+      throw error
+    }
+  }
+}
+
+export class GDPRAPI {
+  static async exportUserData(userId: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/gdpr/export/${userId}`)
+    return response.data
+  }
+
+  static async deleteUserData(userId: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.delete(`/gdpr/delete/${userId}`)
+    return response.data
+  }
+
+  static async getConsentStatus(userId: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/gdpr/consent/${userId}`)
+    return response.data
+  }
+
+  static async updateConsent(userId: string, consent: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`/gdpr/consent/${userId}`, consent)
+    return response.data
+  }
+}
+
+export class EmailNotificationsAPI {
+  // Get email notification settings
+  static async getSettings(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/email-notifications/settings')
+    return response.data
+  }
+
+  // Check email service status
+  static async getEmailServiceStatus(): Promise<ApiResponse<{
+    initialized: boolean;
+    enabled: boolean;
+    provider: string | null;
+    hasConfig: boolean;
+  }>> {
+    const response = await apiClient.get('/email-service/status')
+    return response.data
+  }
+
+  // Update email notification settings
+  static async updateSettings(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put('/email-notifications/settings', data)
+    return response.data
+  }
+
+  /** Published platform templates with per-slot tenant enable state */
+  static async getWhatsappTemplateSlots(): Promise<ApiResponse<{
+    slots: Array<{
+      slotKey: string
+      templateName: string
+      category: string
+      language: string
+      label: string
+      description: string
+      enabled: boolean
+    }>
+  }>> {
+    const response = await apiClient.get('/email-notifications/whatsapp/template-slots')
+    return response.data
+  }
+
+  // Get all staff with email notification preferences
+  static async getStaff(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/email-notifications/staff')
+    return response.data
+  }
+
+  // Update staff email notification preferences
+  static async updateStaffPreferences(staffId: string, data: {
+    enabled?: boolean;
+    preferences?: {
+      dailySummary?: boolean;
+      weeklySummary?: boolean;
+      monthlySummary?: boolean;
+      staffIncentiveSummary?: boolean;
+      payrollSlip?: boolean;
+      timesheetReport?: boolean;
+      appointmentAlerts?: boolean;
+      receiptAlerts?: boolean;
+      exportAlerts?: boolean;
+      systemAlerts?: boolean;
+      lowInventory?: boolean;
+      allowReportsDelivery?: boolean;
+    };
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/email-notifications/staff/${staffId}`, data)
+    return response.data
+  }
+
+  // Send test email
+  static async sendTestEmail(email: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/email-notifications/test', { email })
+    return response.data
+  }
+
+  // Manually trigger daily summary (optional date: YYYY-MM-DD IST)
+  static async sendDailySummary(date?: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/email-notifications/send-daily-summary', date ? { date } : {})
+    return response.data
+  }
+
+  /** Manually trigger weekly summary (previous Mon–Sun week; optional weekStartDate/weekEndDate) */
+  static async sendWeeklySummary(body?: {
+    referenceDate?: string
+    weekStartDate?: string
+    weekEndDate?: string
+    forceRefresh?: boolean
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/email-notifications/send-weekly-summary', body || {})
+    return response.data
+  }
+
+  /** Manually trigger monthly summary (previous calendar month; optional monthKey YYYY-MM) */
+  static async sendMonthlySummary(body?: {
+    referenceDate?: string
+    monthKey?: string
+    forceRefresh?: boolean
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/email-notifications/send-monthly-summary', body || {})
+    return response.data
+  }
+}
+
+// ── Channel Usage API ─────────────────────────────────────────────────────────
+export type ChannelKind = "whatsapp" | "sms" | "email"
+
+export interface ChannelUsageLog {
+  _id: string
+  recipientPhone?: string
+  recipientEmail?: string
+  messageType: string
+  status: "sent" | "failed" | "pending"
+  subject?: string | null
+  error?: string | null
+  timestamp: string
+}
+
+export interface ChannelUsageResponse {
+  quota: number | null
+  used: number
+  remaining: number | null
+  percentUsed: number
+  unlimited?: boolean
+  stats: {
+    total: number
+    sent: number
+    failed: number
+  }
+  logs: ChannelUsageLog[]
+  pagination: {
+    page: number
+    limit: number
+    total: number
+    totalPages: number
+  }
+}
+
+export interface ChannelUsageFilters {
+  page?: number
+  limit?: number
+  status?: "sent" | "failed" | "pending"
+  messageType?: string
+  dateFrom?: string
+  dateTo?: string
+}
+
+function buildChannelUsageParams(filters?: ChannelUsageFilters) {
+  const params = new URLSearchParams()
+  if (filters?.page) params.append("page", String(filters.page))
+  if (filters?.limit) params.append("limit", String(filters.limit))
+  if (filters?.status) params.append("status", filters.status)
+  if (filters?.messageType) params.append("messageType", filters.messageType)
+  if (filters?.dateFrom) params.append("dateFrom", filters.dateFrom)
+  if (filters?.dateTo) params.append("dateTo", filters.dateTo)
+  return params
+}
+
+export class ChannelUsageAPI {
+  static async getWhatsAppUsage(
+    filters?: ChannelUsageFilters
+  ): Promise<ApiResponse<ChannelUsageResponse>> {
+    const params = buildChannelUsageParams(filters)
+    const qs = params.toString()
+    const response = await apiClient.get(
+      qs ? `/channel-usage/whatsapp?${qs}` : "/channel-usage/whatsapp"
+    )
+    return response.data
+  }
+
+  static async getSmsUsage(
+    filters?: ChannelUsageFilters
+  ): Promise<ApiResponse<ChannelUsageResponse>> {
+    const params = buildChannelUsageParams(filters)
+    const qs = params.toString()
+    const response = await apiClient.get(
+      qs ? `/channel-usage/sms?${qs}` : "/channel-usage/sms"
+    )
+    return response.data
+  }
+
+  static async getEmailUsage(
+    filters?: ChannelUsageFilters
+  ): Promise<ApiResponse<ChannelUsageResponse>> {
+    const params = buildChannelUsageParams(filters)
+    const qs = params.toString()
+    const response = await apiClient.get(
+      qs ? `/channel-usage/email?${qs}` : "/channel-usage/email"
+    )
+    return response.data
+  }
+}
+
+// ── Wallet / Recharge API ────────────────────────────────────────────────────
+
+export type WalletProvider = "razorpay" | "stripe" | "zoho"
+
+export interface WalletBalance {
+  balancePaise: number
+  balanceRupees: number
+}
+
+export interface WalletTransaction {
+  _id: string
+  type: "credit" | "debit"
+  amountPaise: number
+  amountRupees: number
+  // GST fields — populated only on `credit` rows where GST was charged.
+  gstPaise?: number
+  gstRupees?: number
+  gstRate?: number
+  totalChargedPaise?: number
+  totalChargedRupees?: number
+  channel: "sms" | "whatsapp" | null
+  messageCategory: "promotional" | "transactional" | null
+  provider: WalletProvider | "system"
+  /** False for platform admin credits — no GST tax invoice. */
+  taxInvoiceEligible?: boolean
+  description: string | null
+  balanceAfterPaise: number
+  balanceAfterRupees: number
+  timestamp: string
+}
+
+export interface WalletTransactionsResponse {
+  logs: WalletTransaction[]
+  pagination: { page: number; limit: number; total: number; totalPages: number }
+}
+
+export interface RechargeOrder {
+  provider: WalletProvider
+  orderId?: string
+  clientSecret?: string
+  sessionUrl?: string
+  // `amountPaise` is the GST-inclusive total captured by the gateway.
+  amountPaise: number
+  currency: string
+  publicKey: string
+  // Breakdown shown to the user. `baseAmountPaise` is the wallet credit (pre-GST).
+  baseAmountPaise?: number
+  gstPaise?: number
+  totalAmountPaise?: number
+  gstRate?: number
+}
+
+export interface RechargeVerifyPayload {
+  provider: WalletProvider
+  orderId?: string
+  paymentId?: string
+  signature?: string
+  amountRupees?: number
+}
+
+export interface RechargeVerifyResponse {
+  newBalancePaise: number
+  newBalanceRupees?: number
+  amountPaise?: number
+  alreadyCredited?: boolean
+  basePaise?: number
+  gstPaise?: number
+  gstRate?: number
+  totalChargedPaise?: number
+}
+
+export class WalletAPI {
+  static async getBalance(): Promise<ApiResponse<WalletBalance>> {
+    const response = await apiClient.get("/wallet/balance")
+    return response.data
+  }
+
+  static async getTransactions(filters?: {
+    page?: number
+    limit?: number
+    type?: "credit" | "debit"
+    channel?: "sms" | "whatsapp"
+    dateFrom?: string
+    dateTo?: string
+  }): Promise<ApiResponse<WalletTransactionsResponse>> {
+    const params = new URLSearchParams()
+    if (filters?.page) params.append("page", String(filters.page))
+    if (filters?.limit) params.append("limit", String(filters.limit))
+    if (filters?.type) params.append("type", filters.type)
+    if (filters?.channel) params.append("channel", filters.channel)
+    if (filters?.dateFrom) params.append("dateFrom", filters.dateFrom)
+    if (filters?.dateTo) params.append("dateTo", filters.dateTo)
+    const qs = params.toString()
+    const response = await apiClient.get(
+      qs ? `/wallet/transactions?${qs}` : "/wallet/transactions"
+    )
+    return response.data
+  }
+
+  static async createRechargeOrder(
+    amountRupees: number
+  ): Promise<ApiResponse<RechargeOrder>> {
+    const response = await apiClient.post("/wallet/recharge/order", {
+      amountRupees,
+    })
+    return response.data
+  }
+
+  static async verifyRecharge(
+    payload: RechargeVerifyPayload
+  ): Promise<ApiResponse<RechargeVerifyResponse>> {
+    const response = await apiClient.post("/wallet/recharge/verify", payload)
+    return response.data
+  }
+
+  /**
+   * Fetch the GST tax-invoice PDF for a recharge transaction and trigger a
+   * browser download. Returns the filename that was saved (useful for tests /
+   * toasts), or throws on non-PDF responses (e.g. 404 / 403 come back as JSON).
+   */
+  static async downloadInvoice(transactionId: string): Promise<string> {
+    const response = await apiClient.get(`/wallet/invoice/${transactionId}`, {
+      responseType: "blob",
+    })
+
+    const contentType = String(response.headers?.["content-type"] || "")
+    if (!contentType.includes("application/pdf")) {
+      let message = "Failed to download invoice"
+      try {
+        const text = await (response.data as Blob).text()
+        const parsed = JSON.parse(text)
+        message = parsed?.error || message
+      } catch {
+        // keep default message
+      }
+      throw new Error(message)
+    }
+
+    const disposition = String(response.headers?.["content-disposition"] || "")
+    const match = disposition.match(/filename="?([^"]+)"?/i)
+    const filename = match?.[1] || `invoice-${transactionId}.pdf`
+
+    const blob = new Blob([response.data as BlobPart], { type: "application/pdf" })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    return filename
+  }
+}
+
+// ── Client prepaid wallet (salon service credit) ─────────────────────────────
+
+export type ClientWalletSettings = {
+  allowCouponStacking: boolean
+  gracePeriodDays: number
+  allowMultiBranch: boolean
+  refundPolicy: "service_credit_only" | "no_refunds"
+  minRechargeAmount: number
+  expiryAlertsEnabled: boolean
+  /** When true, POS redeems across all client wallets FIFO (soonest expiry first). */
+  combineMultipleWallets: boolean
+  /** Line-type redemption toggles (stored in tenant paymentConfiguration). */
+  walletRedemption?: PaymentConfiguration["walletRedemption"]
+}
+
+/** POST /client-wallet/issue */
+export interface ClientWalletIssueRequest {
+  clientId: string
+  planId: string
+  amountPaid?: number
+  /** Credits wallet against this POS sale (no separate bill). Staff may call when set. */
+  saleId?: string
+}
+
+export class ClientWalletAPI {
+  static async getSettings(): Promise<ApiResponse<ClientWalletSettings>> {
+    const response = await apiClient.get("/client-wallet/settings")
+    return response.data
+  }
+
+  static async updateSettings(
+    body: Partial<ClientWalletSettings>
+  ): Promise<ApiResponse<ClientWalletSettings>> {
+    const response = await apiClient.put("/client-wallet/settings", body)
+    return response.data
+  }
+
+  static async listPlans(params?: { status?: string }): Promise<ApiResponse<{ plans: any[] }>> {
+    const response = await apiClient.get("/client-wallet/plans", { params })
+    return response.data
+  }
+
+  static async createPlan(body: {
+    name: string
+    payAmount: number
+    creditAmount: number
+    validityDays: number
+    maxPerClient?: number | null
+    allowCouponStacking?: boolean
+    branchIds?: string[]
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post("/client-wallet/plans", body)
+    return response.data
+  }
+
+  static async updatePlan(id: string, body: Record<string, unknown>): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`/client-wallet/plans/${id}`, body)
+    return response.data
+  }
+
+  static async updatePlanStatus(
+    id: string,
+    status: "active" | "paused" | "archived"
+  ): Promise<ApiResponse<any>> {
+    const response = await apiClient.patch(`/client-wallet/plans/${id}/status`, { status })
+    return response.data
+  }
+
+  /** Archived plans only; fails if any wallet was issued from this plan. */
+  static async deletePlan(id: string): Promise<ApiResponse<{ deleted?: boolean }>> {
+    const response = await apiClient.delete(`/client-wallet/plans/${id}`)
+    return response.data
+  }
+
+  static async issue(body: ClientWalletIssueRequest): Promise<ApiResponse<any>> {
+    const response = await apiClient.post("/client-wallet/issue", body)
+    return response.data
+  }
+
+  static async bulkIssue(body: {
+    clientIds: string[]
+    planId: string
+    amountPaid?: number
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post("/client-wallet/bulk-issue", body)
+    return response.data
+  }
+
+  static async getClientWallets(clientId: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`/client-wallet/client/${clientId}`)
+    return response.data
+  }
+
+  static async redeem(body: {
+    walletId: string
+    amount: number
+    saleId?: string
+    serviceNames?: string[]
+    couponApplied?: boolean
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post("/client-wallet/redeem", body)
+    return response.data
+  }
+
+  static async adjust(body: {
+    walletId: string
+    delta: number
+    reason?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post("/client-wallet/adjust", body)
+    return response.data
+  }
+
+  /** Manager: client has no wallet — open balance wallet with optional opening credit (no plan required) */
+  static async openBalanceWallet(body: {
+    clientId: string
+    amount?: number
+    reason?: string
+  }): Promise<ApiResponse<{ wallet?: any }>> {
+    const response = await apiClient.post("/client-wallet/open-balance-wallet", body)
+    return response.data
+  }
+
+  /** Staff: when customer overpaid and there is no cash change, credit excess to prepaid wallet */
+  static async creditChange(body: {
+    walletId: string
+    amount: number
+    saleId?: string
+    billNo?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post("/client-wallet/credit-change", body)
+    return response.data
+  }
+
+  /** Staff: customer had no prepaid wallet — create one from an active plan and credit bill change */
+  static async creditChangeOpenWallet(body: {
+    clientId: string
+    amount: number
+    saleId: string
+    billNo?: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post("/client-wallet/credit-change-open-wallet", body)
+    return response.data
+  }
+
+  static async getLiability(): Promise<
+    ApiResponse<{ totalOutstanding: number; activeWalletCount: number }>
+  > {
+    const response = await apiClient.get("/client-wallet/liability")
+    return response.data
+  }
+
+  static async listClientLiability(params?: {
+    search?: string
+    page?: number
+    limit?: number
+  }): Promise<
+    ApiResponse<{
+      rows: Array<{
+        clientId: string
+        name: string
+        phone: string
+        email: string
+        totalOutstanding: number
+        walletCount: number
+        soonestExpiry: string | null
+      }>
+      total: number
+      page: number
+      limit: number
+      totalPages: number
+    }>
+  > {
+    const qs = new URLSearchParams()
+    if (params?.search) qs.set("search", params.search)
+    if (params?.page != null) qs.set("page", String(params.page))
+    if (params?.limit != null) qs.set("limit", String(params.limit))
+    const suffix = qs.toString() ? `?${qs.toString()}` : ""
+    const response = await apiClient.get(`/client-wallet/liability/clients${suffix}`)
+    return response.data
+  }
+
+  static async getHistory(params?: {
+    service?: string
+    from?: string
+    to?: string
+    limit?: number
+  }): Promise<ApiResponse<{ history: any[] }>> {
+    const response = await apiClient.get("/client-wallet/history", { params })
+    return response.data
+  }
+}
+
+// ── Reward points (loyalty) ─────────────────────────────────────────────────
+
+export type RewardPointsSettings = {
+  enabled: boolean
+  earnRupeeStep: number
+  earnPointsStep: number
+  redeemPointsStep: number
+  redeemRupeeStep: number
+  minRedeemPoints: number
+  minBillAmountForRedemption: number
+  maxRedeemPercentOfBill: number
+  earnOnWalletPurchaseLines: boolean
+  /** When true, service lines count toward earn base. */
+  earnPointsOnServices: boolean
+  /** When true, product lines count toward earn base. */
+  earnPointsOnProducts: boolean
+  /** When true, membership plan purchase lines count toward earn base. */
+  earnPointsOnMembershipPurchases: boolean
+  /** When true, prepaid wallet plan purchase lines count toward earn base. */
+  earnPointsOnPrepaidPlan: boolean
+  /** Package retail lines (defaults true if omitted). */
+  earnPointsOnPackages?: boolean
+  firstVisitBonusPoints: number
+  birthdayBonusPoints: number
+  birthdayBonusWindowDays: number
+  /** Line-type redemption toggles (stored in tenant paymentConfiguration). */
+  rewardPointRedemption?: PaymentConfiguration["rewardPointRedemption"]
+}
+
+export class RewardPointsAPI {
+  static async getSettings(): Promise<ApiResponse<RewardPointsSettings>> {
+    const response = await apiClient.get("/reward-points/settings")
+    return response.data
+  }
+
+  static async updateSettings(
+    body: Partial<RewardPointsSettings>
+  ): Promise<ApiResponse<RewardPointsSettings>> {
+    const response = await apiClient.put("/reward-points/settings", body)
+    return response.data
+  }
+
+  static async preview(params: {
+    billSubtotal: number
+    points: number
+    clientId: string
+  }): Promise<
+    ApiResponse<{
+      ok: boolean
+      error?: string
+      pointsToRedeem: number
+      discountRupees: number
+      currentBalance: number
+      settings: RewardPointsSettings
+    }>
+  > {
+    const qs = new URLSearchParams({
+      billSubtotal: String(params.billSubtotal),
+      points: String(params.points),
+      clientId: params.clientId,
+    })
+    const response = await apiClient.get(`/reward-points/preview?${qs.toString()}`)
+    return response.data
+  }
+
+  static async getLedger(
+    clientId: string,
+    params?: { limit?: number; skip?: number }
+  ): Promise<ApiResponse<{ rows: any[]; total: number; limit: number; skip: number }>> {
+    const qs = new URLSearchParams({ clientId })
+    if (params?.limit != null) qs.set("limit", String(params.limit))
+    if (params?.skip != null) qs.set("skip", String(params.skip))
+    const response = await apiClient.get(`/reward-points/ledger?${qs.toString()}`)
+    return response.data
+  }
+
+  static async getSummary(clientId: string): Promise<
+    ApiResponse<{
+      balance: number
+      lifetimeEarned: number
+      lifetimeRedeemed: number
+      lastBillEarnPoints: number
+      lastBillEarnAt: string | null
+    }>
+  > {
+    const response = await apiClient.get(`/reward-points/summary?clientId=${encodeURIComponent(clientId)}`)
+    return response.data
+  }
+
+  static async listClientBalances(params?: {
+    search?: string
+    page?: number
+    limit?: number
+    includeZero?: boolean
+  }): Promise<
+    ApiResponse<{
+      rows: Array<{
+        id: string
+        name: string
+        phone: string
+        email: string
+        rewardPointsBalance: number
+        updatedAt: string | null
+      }>
+      total: number
+      page: number
+      limit: number
+      totalPages: number
+    }>
+  > {
+    const qs = new URLSearchParams()
+    if (params?.search) qs.set("search", params.search)
+    if (params?.page != null) qs.set("page", String(params.page))
+    if (params?.limit != null) qs.set("limit", String(params.limit))
+    if (params?.includeZero) qs.set("includeZero", "true")
+    const suffix = qs.toString() ? `?${qs.toString()}` : ""
+    const response = await apiClient.get(`/reward-points/client-balances${suffix}`)
+    return response.data
+  }
+
+  static async grantManualBonus(body: {
+    clientId: string
+    points: number
+    reason?: string
+  }): Promise<ApiResponse<{ balance: number }>> {
+    const response = await apiClient.post("/reward-points/manual-bonus", body)
+    return response.data
+  }
+}
+
+// ── Plan Checkout API ────────────────────────────────────────────────────────
+// Self-service plan renewal / upgrade / scheduled-downgrade endpoints. Mirrors
+// the wallet-recharge flow — the same Razorpay / Stripe / Zoho providers are
+// supported; the UI opens the same modal and posts to `/plan/checkout/verify`
+// instead of `/wallet/recharge/verify`.
+
+export type PlanCheckoutKind = "renewal" | "upgrade" | "change" | "new"
+export type PlanBillingPeriod = "monthly" | "yearly"
+export type { PlanSubscriptionId } from "@/lib/plan-ids"
+
+export interface PlanCheckoutOrder {
+  provider: WalletProvider
+  orderId?: string
+  clientSecret?: string
+  sessionUrl?: string
+  amountPaise: number
+  currency: string
+  publicKey: string
+  planId: PlanSubscriptionId
+  billingPeriod: PlanBillingPeriod
+  baseAmountPaise: number
+  gstPaise: number
+  totalAmountPaise: number
+  gstRate: number
+}
+
+export interface PlanPromoPreview {
+  code: string
+  description: string
+  discountType: "percent" | "fixed"
+  discountValue: number
+  discountPaise: number
+  discountRupees: number
+  basePaise: number
+  baseRupees: number
+  finalPaise: number
+  finalRupees: number
+}
+
+export interface PlanCheckoutVerifyPayload {
+  provider: WalletProvider
+  orderId?: string
+  paymentId?: string
+  signature?: string
+  planId: PlanSubscriptionId
+  billingPeriod: PlanBillingPeriod
+  promoCode?: string
+}
+
+export interface PlanCheckoutVerifyResponse {
+  transactionId?: string
+  kind?: PlanCheckoutKind
+  planId?: PlanSubscriptionId
+  billingPeriod?: PlanBillingPeriod
+  newRenewalDate?: string
+  alreadyApplied?: boolean
+  freeActivation?: boolean
+  invoiceNumber?: string
+  walletBalancePaise?: number
+  amounts?: {
+    basePaise: number
+    gstPaise: number
+    totalChargedPaise: number
+    gstRate: number
+  }
+  promo?: {
+    code: string
+    discountPaise: number
+    discountRupees: number
+  } | null
+  plan?: {
+    planId: PlanSubscriptionId
+    billingPeriod: PlanBillingPeriod
+    renewalDate: string
+    isTrial: boolean
+    pendingPlanId: PlanSubscriptionId | null
+    pendingBillingPeriod: PlanBillingPeriod | null
+    pendingEffectiveAt: string | null
+  }
+}
+
+export interface PlanPendingDowngrade {
+  pendingPlanId: PlanSubscriptionId | null
+  pendingBillingPeriod: PlanBillingPeriod | null
+  pendingEffectiveAt: string | null
+}
+
+export interface PlanCheckoutStatus {
+  plan: Record<string, any> | null
+  pending: PlanPendingDowngrade
+  lastTransaction: {
+    _id: string
+    kind: PlanCheckoutKind
+    planId: PlanSubscriptionId
+    billingPeriod: PlanBillingPeriod
+    invoiceNumber: string | null
+    totalChargedPaise: number
+    timestamp: string
+  } | null
+}
+
+export interface PlanTransaction {
+  _id: string
+  kind: PlanCheckoutKind
+  planId: PlanSubscriptionId
+  billingPeriod: PlanBillingPeriod
+  amountPaise: number
+  gstPaise: number
+  gstRate: number
+  totalChargedPaise: number
+  provider: WalletProvider | "system"
+  providerOrderId: string | null
+  providerPaymentId: string | null
+  invoiceNumber: string | null
+  previousRenewalDate: string | null
+  newRenewalDate: string | null
+  previousPlanId: PlanSubscriptionId | null
+  previousBillingPeriod: PlanBillingPeriod | null
+  description: string | null
+  timestamp: string
+}
+
+export interface PlanTransactionsResponse {
+  items: PlanTransaction[]
+  pagination: {
+    page: number
+    limit: number
+    total: number
+    totalPages: number
+  }
+}
+
+export class PlanCheckoutAPI {
+  static async validatePromo(
+    planId: PlanSubscriptionId,
+    billingPeriod: PlanBillingPeriod,
+    promoCode: string
+  ): Promise<
+    ApiResponse<{
+      promo: PlanPromoPreview
+      walletChargePaise: number
+      walletChargeRupees: number
+    }>
+  > {
+    const response = await apiClient.post("/plan/checkout/validate-promo", {
+      planId,
+      billingPeriod,
+      promoCode,
+    })
+    return response.data
+  }
+
+  static async createOrder(
+    planId: PlanSubscriptionId,
+    billingPeriod: PlanBillingPeriod,
+    promoCode?: string
+  ): Promise<ApiResponse<PlanCheckoutOrder>> {
+    const response = await apiClient.post("/plan/checkout/order", {
+      planId,
+      billingPeriod,
+      promoCode: promoCode?.trim() || undefined,
+    })
+    return response.data
+  }
+
+  static async verify(
+    payload: PlanCheckoutVerifyPayload
+  ): Promise<ApiResponse<PlanCheckoutVerifyResponse>> {
+    const response = await apiClient.post("/plan/checkout/verify", payload)
+    return response.data
+  }
+
+  static async payWithWallet(
+    planId: PlanSubscriptionId,
+    billingPeriod: PlanBillingPeriod,
+    promoCode?: string
+  ): Promise<ApiResponse<PlanCheckoutVerifyResponse>> {
+    const response = await apiClient.post("/plan/checkout/wallet", {
+      planId,
+      billingPeriod,
+      promoCode: promoCode?.trim() || undefined,
+    })
+    return response.data
+  }
+
+  static async scheduleDowngrade(
+    planId: PlanSubscriptionId,
+    billingPeriod: PlanBillingPeriod
+  ): Promise<ApiResponse<PlanPendingDowngrade>> {
+    const response = await apiClient.post("/plan/schedule-downgrade", {
+      planId,
+      billingPeriod,
+    })
+    return response.data
+  }
+
+  static async cancelScheduledDowngrade(): Promise<
+    ApiResponse<PlanPendingDowngrade>
+  > {
+    const response = await apiClient.delete("/plan/schedule-downgrade")
+    return response.data
+  }
+
+  static async getStatus(): Promise<ApiResponse<PlanCheckoutStatus>> {
+    const response = await apiClient.get("/plan/checkout/status")
+    return response.data
+  }
+
+  static async listTransactions(
+    params: { page?: number; limit?: number } = {}
+  ): Promise<ApiResponse<PlanTransactionsResponse>> {
+    const qs = new URLSearchParams()
+    if (params.page) qs.append("page", String(params.page))
+    if (params.limit) qs.append("limit", String(params.limit))
+    const query = qs.toString()
+    const response = await apiClient.get(
+      query ? `/plan/transactions?${query}` : "/plan/transactions"
+    )
+    return response.data
+  }
+}
+
+export type { PaymentConfiguration, PaymentRedemptionLine } from "./payment-redemption-eligibility"
+
+export type RewardRedemptionThreshold = {
+  minBillAmountForRedemption?: number
+  maxRedeemPercentOfBill?: number
+}
+
+/** GET /settings/payment `data` shape (aligned with backend/server.js). */
+export type PaymentSettingsData = {
+  paymentConfiguration?: Partial<PaymentConfiguration> | null
+  rewardRedemptionThreshold?: RewardRedemptionThreshold
+  processingFee?: number | string
+  enableProcessingFees?: boolean
+  currency?: string
+  taxRate?: number
+  enableCurrency?: boolean
+  enableTax?: boolean
+  taxType?: "single" | "gst" | "vat" | "sales"
+  cgstRate?: number
+  sgstRate?: number
+  igstRate?: number
+  serviceTaxRate?: number
+  membershipTaxRate?: number
+  packageTaxRate?: number
+  prepaidWalletTaxRate?: number
+  productTaxRate?: number
+  essentialProductRate?: number
+  intermediateProductRate?: number
+  standardProductRate?: number
+  luxuryProductRate?: number
+  exemptProductRate?: number
+  taxCategories?: Array<{ id?: string; name?: string; rate?: number }>
+  priceInclusiveOfTax?: boolean
+}
+
+export type PaymentSettingsUpdatePayload = {
+  processingFee?: number
+  enableProcessingFees?: boolean
+  paymentConfiguration?: PaymentConfiguration
+  rewardRedemptionThreshold?: RewardRedemptionThreshold
+} & Record<string, unknown>
+
+// =============================================================================
+// WhatsApp Business module (Gupshup)
+// =============================================================================
+
+export class WhatsAppGupshupAPI {
+  static async getStatus(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/whatsapp/gupshup/status')
+    return response.data
+  }
+
+  static async connect(payload: {
+    appId: string
+    appName?: string
+    sourceNumber: string
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/whatsapp/gupshup/connect', payload)
+    return response.data
+  }
+
+  static async disconnect(): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/whatsapp/gupshup/disconnect')
+    return response.data
+  }
+
+  static async refresh(): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/whatsapp/gupshup/refresh')
+    return response.data
+  }
+
+  static async sendTest(to: string, gupshupTemplateId: string, params: string[] = []): Promise<ApiResponse<any>> {
+    const response = await apiClient.post('/whatsapp/gupshup/test-message', { to, gupshupTemplateId, params })
+    return response.data
+  }
+
+  static async getCompliance(): Promise<ApiResponse<any>> {
+    const response = await apiClient.get('/whatsapp/gupshup/compliance')
+    return response.data
+  }
+}
+
+/** @deprecated use WhatsAppGupshupAPI */
+export const WhatsAppMetaAPI = WhatsAppGupshupAPI
+
+export class WhatsAppTemplatesAPI {
+  private static readonly basePath = '/whatsapp/gupshup/templates'
+
+  static async list(params?: {
+    status?: string
+    search?: string
+    origin?: "own" | "all"
+    limit?: number
+    skip?: number
+  }): Promise<ApiResponse<any[]> & { total?: number; limit?: number; skip?: number }> {
+    const response = await apiClient.get(WhatsAppTemplatesAPI.basePath, { params })
+    return response.data
+  }
+
+  static async get(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`${WhatsAppTemplatesAPI.basePath}/${id}`)
+    return response.data
+  }
+
+  static async fromGupshup(): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get(`${WhatsAppTemplatesAPI.basePath}/from-gupshup`)
+    return response.data
+  }
+
+  /** @deprecated use fromGupshup */
+  static async fromMeta(): Promise<ApiResponse<any[]>> {
+    return this.fromGupshup()
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(WhatsAppTemplatesAPI.basePath, data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`${WhatsAppTemplatesAPI.basePath}/${id}`, data)
+    return response.data
+  }
+
+  static async submit(
+    id: string,
+    body?: { name?: string; urlExamples?: Record<string, string> }
+  ): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`${WhatsAppTemplatesAPI.basePath}/${id}/submit`, body ?? {})
+    return response.data
+  }
+
+  static async sync(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`${WhatsAppTemplatesAPI.basePath}/${id}/sync`)
+    return response.data
+  }
+
+  static async syncAll(): Promise<ApiResponse<{ imported: number; updated: number; total: number }>> {
+    const response = await apiClient.post(`${WhatsAppTemplatesAPI.basePath}/sync-all`)
+    return response.data
+  }
+
+  static async remove(id: string, opts?: { force?: boolean }): Promise<ApiResponse> {
+    const response = await apiClient.delete(`${WhatsAppTemplatesAPI.basePath}/${id}`, {
+      params: opts?.force ? { force: 1 } : undefined,
+    })
+    return response.data
+  }
+
+  static async catalog(): Promise<ApiResponse<{ slotKeys: string[]; catalog: any[] }>> {
+    const response = await apiClient.get(`${WhatsAppTemplatesAPI.basePath}/catalog`)
+    return response.data
+  }
+
+  /** @deprecated use catalog */
+  static async meta(): Promise<ApiResponse<{ slotKeys: string[]; catalog: any[] }>> {
+    return this.catalog()
+  }
+
+  static async library(scope: "promotional" | "transactional"): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get(`${WhatsAppTemplatesAPI.basePath}/library`, { params: { scope } })
+    return response.data
+  }
+
+  static async libraryAvailable(scope: "promotional" | "transactional"): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get(`${WhatsAppTemplatesAPI.basePath}/library/available`, { params: { scope } })
+    return response.data
+  }
+
+  static async importCatalog(scope: "promotional" | "transactional"): Promise<ApiResponse<{ imported: number; skipped: string[] }>> {
+    const response = await apiClient.post(`${WhatsAppTemplatesAPI.basePath}/import-catalog`, { scope })
+    return response.data
+  }
+
+  static async importFromLibrary(platformTemplateId: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`${WhatsAppTemplatesAPI.basePath}/library/${platformTemplateId}/import`)
+    return response.data
+  }
+
+  /** `names` optionally renames templates on import, keyed by platform template id. */
+  static async importLibraryBatch(
+    platformTemplateIds: string[],
+    names?: Record<string, string>,
+    urlExamples?: Record<string, Record<string, string>>
+  ): Promise<
+    ApiResponse<{ imported: number; skipped: Array<{ id: string; reason: string; name?: string }>; templateIds: string[] }>
+  > {
+    const response = await apiClient.post(`${WhatsAppTemplatesAPI.basePath}/library/import-batch`, {
+      platformTemplateIds,
+      ...(names && Object.keys(names).length ? { names } : {}),
+      ...(urlExamples && Object.keys(urlExamples).length ? { urlExamples } : {}),
+    })
+    return response.data
+  }
+
+  static async syncSlots(): Promise<ApiResponse<{ linked: any[]; pending: any[]; unmatched: any[] }>> {
+    const response = await apiClient.post(`${WhatsAppTemplatesAPI.basePath}/sync-slots`)
+    return response.data
+  }
+
+  static async map(id: string, slotKey: string | null): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`${WhatsAppTemplatesAPI.basePath}/${id}/map`, { slotKey })
+    return response.data
+  }
+
+  static async uploadHeaderMedia(
+    format: "IMAGE" | "VIDEO" | "DOCUMENT",
+    media: string,
+    contentType?: string
+  ): Promise<ApiResponse<{ url: string }>> {
+    const response = await apiClient.post(`${WhatsAppTemplatesAPI.basePath}/upload-header-media`, {
+      format,
+      media,
+      ...(contentType ? { contentType } : {}),
+    })
+    return response.data
+  }
+}
+
+export class WhatsAppCampaignsAPI {
+  private static readonly basePath = '/whatsapp/gupshup/campaigns'
+
+  static async list(): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get(WhatsAppCampaignsAPI.basePath)
+    return response.data
+  }
+
+  static async get(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`${WhatsAppCampaignsAPI.basePath}/${id}`)
+    return response.data
+  }
+
+  static async create(data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(WhatsAppCampaignsAPI.basePath, data)
+    return response.data
+  }
+
+  static async update(id: string, data: any): Promise<ApiResponse<any>> {
+    const response = await apiClient.put(`${WhatsAppCampaignsAPI.basePath}/${id}`, data)
+    return response.data
+  }
+
+  static async preview(id: string): Promise<ApiResponse<{ count: number; excludedOptOut?: number; sample: any[] }>> {
+    const response = await apiClient.post(`${WhatsAppCampaignsAPI.basePath}/${id}/recipients/preview`)
+    return response.data
+  }
+
+  static async send(id: string): Promise<ApiResponse<{ recipientCount: number; expectedSpendPaise: number }>> {
+    const response = await apiClient.post(`${WhatsAppCampaignsAPI.basePath}/${id}/send`)
+    return response.data
+  }
+
+  static async schedule(id: string, scheduledAt: string): Promise<ApiResponse<any>> {
+    // Updating `scheduledAt` flips status to `scheduled`; the cron picks it
+    // up at the appropriate time.
+    const response = await apiClient.put(`${WhatsAppCampaignsAPI.basePath}/${id}`, { scheduledAt })
+    return response.data
+  }
+
+  static async cancel(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`${WhatsAppCampaignsAPI.basePath}/${id}/cancel`)
+    return response.data
+  }
+
+  static async stats(id: string): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`${WhatsAppCampaignsAPI.basePath}/${id}/stats`)
+    return response.data
+  }
+}
+
+export class WhatsAppMessagesAPI {
+  private static readonly basePath = '/whatsapp/gupshup/messages'
+
+  static async list(params?: Record<string, any>): Promise<ApiResponse<{ items: any[]; total: number }>> {
+    const response = await apiClient.get(WhatsAppMessagesAPI.basePath, { params })
+    return response.data
+  }
+
+  static async usage(params?: Record<string, any>): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`${WhatsAppMessagesAPI.basePath}/usage`, { params })
+    return response.data
+  }
+
+  static async tracking(params?: { dateFrom?: string; dateTo?: string }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`${WhatsAppMessagesAPI.basePath}/tracking`, { params })
+    return response.data
+  }
+
+  static async logs(filters?: {
+    dateFrom?: string
+    dateTo?: string
+    status?: string
+    messageType?: string
+    businessId?: string
+    page?: number
+    limit?: number
+  }): Promise<ApiResponse<any>> {
+    const response = await apiClient.get(`${WhatsAppMessagesAPI.basePath}/logs`, { params: filters })
+    return response.data
+  }
+}
+
+/** @deprecated use WhatsAppGupshupAPI / WhatsAppMessagesAPI */
+export class WhatsAppAPI {
+  static async testConnection(
+    phone: string,
+    gupshupTemplateId: string,
+    params: string[] = []
+  ): Promise<ApiResponse<any>> {
+    return WhatsAppGupshupAPI.sendTest(phone, gupshupTemplateId, params)
+  }
+
+  static async getBusinessTracking(filters?: { dateFrom?: string; dateTo?: string }) {
+    return WhatsAppMessagesAPI.tracking(filters)
+  }
+
+  static async getLogs(filters?: Parameters<typeof WhatsAppMessagesAPI.logs>[0]) {
+    return WhatsAppMessagesAPI.logs(filters)
+  }
+}
+
+export type WhatsAppInboxFilter = 'all' | 'unread' | 'open' | 'resolved' | 'optedout'
+
+export class WhatsAppInboxAPI {
+  private static readonly basePath = '/whatsapp/gupshup/inbox'
+
+  static async list(params?: { filter?: WhatsAppInboxFilter; q?: string; limit?: number }): Promise<ApiResponse<any[]>> {
+    const response = await apiClient.get(WhatsAppInboxAPI.basePath, { params })
+    return response.data
+  }
+
+  static async thread(conversationId: string): Promise<ApiResponse<{ conversation: any; messages: any[] }>> {
+    const response = await apiClient.get(`${WhatsAppInboxAPI.basePath}/${conversationId}`)
+    return response.data
+  }
+
+  static async reply(
+    conversationId: string,
+    payload: {
+      mode?: 'text' | 'template'
+      text?: string
+      templateName?: string
+      language?: string
+      components?: any[]
+      /**
+       * Flat placeholder map keyed by the placeholder index (and "h<N>"
+       * for header placeholders). The backend will fetch the template
+       * and translate this into the Meta-shape `components` array.
+       */
+      variables?: Record<string, string>
+    }
+  ): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`${WhatsAppInboxAPI.basePath}/${conversationId}/reply`, payload)
+    return response.data
+  }
+
+  static async resolve(conversationId: string, resolved = true): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`${WhatsAppInboxAPI.basePath}/${conversationId}/resolve`, { resolved })
+    return response.data
+  }
+
+  static async consent(
+    conversationId: string,
+    payload: { optedIn: boolean; reason: string }
+  ): Promise<ApiResponse<any>> {
+    const response = await apiClient.post(`${WhatsAppInboxAPI.basePath}/${conversationId}/consent`, payload)
+    return response.data
+  }
+
+  /**
+   * Returns the placeholder schema for a template so the inbox composer
+   * can render variable inputs per `{{N}}` it finds in header/body.
+   */
+  static async templateDetail(
+    name: string,
+    language = 'en_US'
+  ): Promise<ApiResponse<{
+    name: string
+    language: string
+    status: string
+    category: string
+    components: any
+    placeholders: {
+      header: { key: string; label: string; sample: string; index: number }[]
+      body: { key: string; label: string; sample: string; index: number }[]
+    }
+  }>> {
+    const response = await apiClient.get(`${WhatsAppInboxAPI.basePath}/templates/${encodeURIComponent(name)}`, {
+      params: { language },
+    })
+    return response.data
+  }
+}
+
+export class PlatformAPI {
+  static async getNavBanner(): Promise<
+    ApiResponse<{
+      active: {
+        theme: string
+        enabled: boolean
+        expiresAt: string
+        headline: string
+        tagline: string
+      } | null
+      banners: Record<
+        string,
+        {
+          enabled: boolean
+          expiresAt: string
+          headline: string
+          tagline: string
+        }
+      >
+    }>
+  > {
+    const response = await apiClient.get("/platform/nav-banner")
+    return response.data
+  }
+}
+
+// Export the main API client for direct use if needed
+export { apiClient }
+export default apiClient 

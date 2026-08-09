@@ -1,0 +1,11 @@
+node_modules
+tests
+.git
+**/*.log
+**/*.pid
+.env
+.env.*
+config.env
+**/.DS_Store
+Dockerfile
+.dockerignore

@@ -1,0 +1,501 @@
+const mongoose = require('mongoose');
+const { generateNextBusinessCode } = require('../lib/generate-business-code');
+
+const businessSchema = new mongoose.Schema({
+  // Basic Information
+  name: { type: String, required: true },
+  code: { type: String, unique: true }, // Generated unique code
+  /** Vanity public storefront slug; falls back to code.toLowerCase() when unset */
+  slug: {
+    type: String,
+    trim: true,
+    lowercase: true,
+    unique: true,
+    sparse: true,
+    index: true,
+  },
+  /** Previous slugs that 301 to the current slug */
+  slugAliases: { type: [String], default: [] },
+  businessType: { 
+    type: String, 
+    enum: ['salon', 'spa', 'barbershop', 'beauty_clinic'], 
+    default: 'salon' 
+  },
+  
+  // Contact Information
+  address: {
+    street: { type: String, required: true },
+    city: { type: String, required: true },
+    state: { type: String, required: true },
+    zipCode: { type: String, required: true },
+    country: { type: String, default: 'India' }
+  },
+  contact: {
+    phone: { type: String, required: true },
+    email: { type: String, required: true },
+    website: { type: String }
+  },
+  
+  // Business Settings (from existing settings)
+  settings: {
+    timezone: { type: String, default: 'Asia/Kolkata' },
+    currency: { type: String, default: 'INR' },
+    currencySymbol: { type: String, default: '₹' },
+    dateFormat: { type: String, default: 'DD/MM/YYYY' },
+    timeFormat: { type: String, default: '12' }, // 12 or 24 hour
+    taxRate: { type: Number, default: 18 },
+    gstNumber: { type: String },
+    businessLicense: { type: String },
+    
+    // Operating Hours
+    operatingHours: {
+      monday: { open: String, close: String, closed: Boolean },
+      tuesday: { open: String, close: String, closed: Boolean },
+      wednesday: { open: String, close: String, closed: Boolean },
+      thursday: { open: String, close: String, closed: Boolean },
+      friday: { open: String, close: String, closed: Boolean },
+      saturday: { open: String, close: String, closed: Boolean },
+      sunday: { open: String, close: String, closed: Boolean }
+    },
+    
+    // Appointment Settings
+    appointmentSettings: {
+      slotDuration: { type: Number, default: 30 }, // minutes
+      advanceBookingDays: { type: Number, default: 30 },
+      bufferTime: { type: Number, default: 15 }, // minutes
+      allowOnlineBooking: { type: Boolean, default: false },
+      allowCrossBranchBooking: { type: Boolean, default: false },
+      cancellationWindowHours: { type: Number, default: 24, min: 0 },
+      /** Short line under salon name on the public booking page */
+      bookingTagline: { type: String, default: '' },
+      /** Up to 8 HTTPS or data-URL images for the public booking showcase carousel */
+      showcaseImages: { type: [String], default: [] },
+      /** Public booking hero background theme id */
+      bookingHeroTheme: { type: String, default: 'light-lavender' },
+    },
+
+    /** Monthly revenue target for branch-management overview (INR). */
+    revenueTarget: {
+      monthly: { type: Number, default: 0, min: 0 },
+    },
+
+    /** Org-wide multi-location preferences (kept in sync on all branches for the owner). */
+    multiLocation: {
+      /** When true, client profiles are visible and searchable at every branch. */
+      shareClientsAcrossBranches: { type: Boolean, default: false },
+    },
+
+    /**
+     * HQ service overrides keyed by merge key (SKU or normalized name).
+     * Tenant Service docs are unchanged until booking APIs read overrides.
+     */
+    serviceOverrides: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
+    
+    /** When true, platform admin has disabled all tenant operational email for this business */
+    platformEmailDisabled: { type: Boolean, default: false },
+
+    // Notification Settings
+    notifications: {
+      emailNotifications: { type: Boolean, default: true },
+      smsNotifications: { type: Boolean, default: false },
+      appointmentReminders: { type: Boolean, default: true },
+      paymentConfirmations: { type: Boolean, default: true }
+    },
+    
+    // Email Notification Configuration
+    emailNotificationSettings: {
+      enabled: { type: Boolean, default: true },
+      // Staff members selected to receive notifications
+      recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }],
+      // Daily Summary Configuration
+      dailySummary: {
+        enabled: { type: Boolean, default: true },
+        // When to send daily summary emails:
+        // - 'fixedTime': at a specific time of day (uses scheduler)
+        // - 'afterClosing': when the day's cash registry status is verified (triggered on verify)
+        mode: { type: String, enum: ['fixedTime', 'afterClosing'], default: 'fixedTime' },
+        time: { type: String, default: '21:00' }, // HH:mm format
+        recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }]
+      },
+      // Weekly Summary Configuration
+      weeklySummary: {
+        enabled: { type: Boolean, default: true },
+        day: { type: String, enum: ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'], default: 'monday' },
+        time: { type: String, default: '09:00' }, // HH:mm IST — previous Mon–Sun week
+        revenueGoal: { type: Number, default: null },
+        recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }]
+      },
+      monthlySummary: {
+        enabled: { type: Boolean, default: true },
+        time: { type: String, default: '09:00' },
+        revenueGoal: { type: Number, default: null },
+        recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }]
+      },
+      // Staff incentive summary — sent on the 1st for the previous calendar month
+      staffIncentiveSummary: {
+        enabled: { type: Boolean, default: true },
+        time: { type: String, default: '12:00' },
+        recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }]
+      },
+      // Payroll / salary slip — sent on the 1st for the previous calendar month
+      payrollNotifications: {
+        enabled: { type: Boolean, default: true },
+        time: { type: String, default: '12:00' },
+        attachSalarySlip: { type: Boolean, default: true },
+        recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }]
+      },
+      // Timesheet reports — sent to each staff member on the 1st for the previous month
+      timesheetNotifications: {
+        enabled: { type: Boolean, default: true },
+        time: { type: String, default: '12:00' },
+        format: { type: String, enum: ['xlsx', 'pdf'], default: 'xlsx' }
+      },
+      // Appointment Notifications
+      appointmentNotifications: {
+        enabled: { type: Boolean, default: true },
+        newAppointments: { type: Boolean, default: true },
+        cancellations: { type: Boolean, default: true },
+        noShows: { type: Boolean, default: false },
+        reminders: { type: Boolean, default: false },
+        reminderHoursBefore: { type: Number, default: 24 },
+        recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }]
+      },
+      // Receipt Notifications
+      receiptNotifications: {
+        enabled: { type: Boolean, default: true },
+        sendToClients: { type: Boolean, default: true },
+        sendToStaff: { type: Boolean, default: false },
+        highValueThreshold: { type: Number, default: 0 }, // Alert if receipt > this amount
+        recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }]
+      },
+      // Export Notifications
+      exportNotifications: {
+        enabled: { type: Boolean, default: true },
+        recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }]
+      },
+      // System Alerts
+      systemAlerts: {
+        enabled: { type: Boolean, default: true },
+        lowInventory: { type: Boolean, default: true },
+        paymentFailures: { type: Boolean, default: true },
+        systemErrors: { type: Boolean, default: true },
+        recipientStaffIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Staff' }]
+      }
+    },
+    
+    // WhatsApp Notification Configuration (separate from email - managed in WhatsApp tab)
+    whatsappNotificationSettings: {
+      enabled: { type: Boolean, default: false },
+      receiptNotifications: {
+        enabled: { type: Boolean, default: true },
+        autoSendToClients: { type: Boolean, default: true },
+        highValueThreshold: { type: Number, default: 0 },
+        /** Growth/Pro only: include Share Feedback button on WhatsApp receipts */
+        includeFeedbackLink: { type: Boolean, default: false },
+      },
+      appointmentNotifications: {
+        enabled: { type: Boolean, default: false },
+        newAppointments: { type: Boolean, default: false },
+        confirmations: { type: Boolean, default: false },
+        reminders: { type: Boolean, default: false },
+        cancellations: { type: Boolean, default: false }
+      },
+      systemAlerts: {
+        enabled: { type: Boolean, default: false },
+        lowInventory: { type: Boolean, default: false },
+        paymentFailures: { type: Boolean, default: false }
+      },
+      /** WhatsApp when a client prepaid wallet is credited/debited/adjusted */
+      clientWalletTransactionNotifications: {
+        enabled: { type: Boolean, default: true },
+      },
+      /** WhatsApp template for 30/15/7-day prepaid wallet expiry reminders (requires admin template) */
+      clientWalletExpiryReminderNotifications: {
+        enabled: { type: Boolean, default: true },
+      },
+      /** WhatsApp when client has outstanding bill dues (every 7 days) */
+      clientDuesReminderNotifications: {
+        enabled: { type: Boolean, default: true },
+      },
+      /** WhatsApp birthday wish on client's date of birth */
+      clientBirthdayReminderNotifications: {
+        enabled: { type: Boolean, default: true },
+      },
+      /** Per published template slot: { [slotKey]: { enabled: boolean } } */
+      templateNotifications: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+      /**
+       * Per-business Gupshup template ids for transactional slots (connected own app).
+       * Populated via WhatsApp → Templates → Map. Shared-number salons use AdminSettings.
+       */
+      templates: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+      /** Maps body_1 / button_1 etc. to CRM field names per slot. */
+      templateVariables: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+    },
+    
+    // Branding
+    branding: {
+      logo: { type: String },
+      primaryColor: { type: String, default: '#3B82F6' },
+      secondaryColor: { type: String, default: '#1E40AF' },
+      fontFamily: { type: String, default: 'Inter' }
+    },
+
+    /** Public mini website / storefront settings */
+    website: {
+      enabled: { type: Boolean, default: false },
+      coverImage: { type: String, default: '' },
+      coverImages: { type: [String], default: [] },
+      tagline: { type: String, default: '' },
+      description: { type: String, default: '', maxlength: 2000 },
+      themeColor: { type: String, default: '#111827' },
+      businessCategory: { type: String, default: '' },
+      seo: {
+        title: { type: String, default: '' },
+        metaDescription: { type: String, default: '' },
+        ogImage: { type: String, default: '' },
+      },
+      social: {
+        instagram: { type: String, default: '' },
+        facebook: { type: String, default: '' },
+        googleMapsUrl: { type: String, default: '' },
+        googleProfileUrl: { type: String, default: '' },
+      },
+      contact: {
+        whatsappNumber: { type: String, default: '' },
+        callNumber: { type: String, default: '' },
+      },
+      visibility: {
+        showPrices: { type: Boolean, default: true },
+        showServices: { type: Boolean, default: true },
+        showStaff: { type: Boolean, default: true },
+        showProducts: { type: Boolean, default: true },
+        retailProductsOnly: { type: Boolean, default: false },
+        showProductPrices: { type: Boolean, default: true },
+        showProductImages: { type: Boolean, default: true },
+        showPackages: { type: Boolean, default: true },
+        showMemberships: { type: Boolean, default: false },
+        showPrepaidWallets: { type: Boolean, default: false },
+        showOffers: { type: Boolean, default: true },
+        showGallery: { type: Boolean, default: true },
+        showReviews: { type: Boolean, default: true },
+      },
+      featured: {
+        serviceIds: [{ type: mongoose.Schema.Types.ObjectId }],
+        packageIds: [{ type: mongoose.Schema.Types.ObjectId }],
+        productIds: [{ type: mongoose.Schema.Types.ObjectId }],
+        membershipIds: [{ type: mongoose.Schema.Types.ObjectId }],
+      },
+      externalAnalytics: {
+        gaMeasurementId: { type: String, default: '' },
+        metaPixelId: { type: String, default: '' },
+        plausibleDomain: { type: String, default: '' },
+      },
+      enquiryForm: {
+        customFields: {
+          type: [
+            {
+              key: { type: String, default: '' },
+              label: { type: String, default: '' },
+              type: {
+                type: String,
+                enum: ['text', 'textarea', 'email', 'phone', 'number', 'date', 'select'],
+                default: 'text',
+              },
+              required: { type: Boolean, default: false },
+              placeholder: { type: String, default: '' },
+              options: [{ type: String }],
+              order: { type: Number, default: 0 },
+            },
+          ],
+          default: [],
+        },
+      },
+    },
+  },
+  
+  
+  // Owner Information
+  owner: { 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'User', 
+    required: true 
+  },
+  
+  // Status and Metadata
+  status: { 
+    type: String, 
+    enum: ['active', 'inactive', 'suspended', 'deleted'], 
+    default: 'active' 
+  },
+  /** When status became suspended (billing overdue). */
+  suspendedAt: { type: Date, default: null },
+  isOnboarded: { type: Boolean, default: false },
+  onboardingStep: { type: Number, default: 0 },
+  deletedAt: { type: Date },
+  deletedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' }, // Track who deleted it
+  
+  // Multi-tenant support
+  branchId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business' },
+  
+  // Pricing Plan Management
+  plan: {
+    planId: { 
+      type: String, 
+      enum: ['starter', 'growth', 'pro'],
+      default: 'starter'
+    },
+    billingPeriod: { 
+      type: String, 
+      enum: ['monthly', 'yearly'], 
+      default: 'monthly' 
+    },
+    renewalDate: { type: Date },
+    /** Last time tenant used self-service 1-day billing grace while suspended */
+    lastOneDayGraceExtensionAt: { type: Date, default: null },
+    isTrial: { type: Boolean, default: false },
+    trialEndsAt: { type: Date },
+    // Scheduled downgrade: when a business picks a lower-tier plan from
+    // the self-service checkout, we do NOT charge — instead we stamp the
+    // target here and switch the live plan at renewal time.
+    // `pendingEffectiveAt` is set to the current `renewalDate` at queue time;
+    // keep it in sync if `renewalDate` changes later (e.g. a renewal happens
+    // while a downgrade is queued — in that case we clear the queue).
+    pendingPlanId: {
+      type: String,
+      enum: ['starter', 'growth', 'pro', null],
+      default: null,
+    },
+    pendingBillingPeriod: {
+      type: String,
+      enum: ['monthly', 'yearly', null],
+      default: null,
+    },
+    pendingEffectiveAt: { type: Date, default: null },
+    // Feature overrides (admin-managed)
+    overrides: {
+      features: [{ type: String }], // Promotional grants beyond plan defaults
+      disabledFeatures: [{ type: String }], // Plan features revoked by admin
+      expiresAt: { type: Date }, // Optional expiry for promotional grants only
+      notes: { type: String }, // Reason for override
+    },
+    // Add-ons (e.g., WhatsApp, SMS).
+    // NOTE: `quota` / `used` / `lastResetAt` on whatsapp/sms are DEPRECATED.
+    // Those channels are now billed per-message from `wallet.balancePaise`
+    // (see backend/lib/wallet-deduction.js). Fields are retained only to
+    // avoid breaking older documents and any legacy read paths.
+    addons: {
+      /**
+       * Transactional WhatsApp notifications (receipts, appointments, etc.).
+       * Sends via Gupshup when enabled together with WABA or this add-on.
+       */
+      whatsapp: {
+        enabled: { type: Boolean, default: false },
+        quota: { type: Number, default: 0 },
+        used: { type: Number, default: 0 },
+        lastResetAt: { type: Date },
+      },
+      /**
+       * Gupshup WABA integration. When ON, templates, campaigns, inbox, and
+       * webhook-driven status are available. Sends route via Gupshup (own app
+       * when connected, otherwise the shared platform number).
+       */
+      waba: {
+        enabled: { type: Boolean, default: false },
+        quota: { type: Number, default: 0 },
+        used: { type: Number, default: 0 },
+        lastResetAt: { type: Date },
+      },
+      sms: {
+        enabled: { type: Boolean, default: false },
+        quota: { type: Number, default: 0 },
+        used: { type: Number, default: 0 },
+        lastResetAt: { type: Date },
+      },
+    },
+  },
+
+  /** Client prepaid wallet (salon-issued service credit) — not the messaging wallet */
+  clientWalletSettings: {
+    allowCouponStacking: { type: Boolean, default: false },
+    gracePeriodDays: { type: Number, default: 0, min: 0, max: 90 },
+    allowMultiBranch: { type: Boolean, default: false },
+    refundPolicy: {
+      type: String,
+      enum: ['service_credit_only', 'no_refunds'],
+      default: 'service_credit_only',
+    },
+    minRechargeAmount: { type: Number, default: 500, min: 0 },
+    /** SMS / WhatsApp expiry reminders (30 / 15 / 7 days before wallet expiryDate) */
+    expiryAlertsEnabled: { type: Boolean, default: true },
+    /**
+     * When true, checkout redeems FIFO across all active client wallets (soonest expiry first).
+     * When false, each wallet is separate (staff picks one wallet).
+     */
+    combineMultipleWallets: { type: Boolean, default: false },
+  },
+
+  /** Customer reward / loyalty points (tenant bills read from main Business) */
+  rewardPointsSettings: {
+    enabled: { type: Boolean, default: false },
+    /** Every earnRupeeStep rupees of eligible spend => earnPointsStep points */
+    earnRupeeStep: { type: Number, default: 100, min: 1 },
+    earnPointsStep: { type: Number, default: 10, min: 0 },
+    /** redeemPointsStep points => redeemRupeeStep rupee discount */
+    redeemPointsStep: { type: Number, default: 100, min: 1 },
+    redeemRupeeStep: { type: Number, default: 10, min: 0 },
+    minRedeemPoints: { type: Number, default: 100, min: 0 },
+    /** Minimum eligible bill subtotal (₹) before reward points may be redeemed; 0 = no minimum. */
+    minBillAmountForRedemption: { type: Number, default: 0, min: 0 },
+    maxRedeemPercentOfBill: { type: Number, default: 20, min: 0, max: 100 },
+    /** Exclude prepaid_wallet lines from eligible spend for earning (synced with earnPointsOnPrepaidPlan) */
+    earnOnWalletPurchaseLines: { type: Boolean, default: false },
+    /** Eligible spend for earning — per line type (false = no points from that line type) */
+    earnPointsOnServices: { type: Boolean, default: true },
+    earnPointsOnProducts: { type: Boolean, default: true },
+    earnPointsOnMembershipPurchases: { type: Boolean, default: true },
+    earnPointsOnPrepaidPlan: { type: Boolean, default: false },
+    earnPointsOnPackages: { type: Boolean, default: true },
+    firstVisitBonusPoints: { type: Number, default: 0, min: 0 },
+    birthdayBonusPoints: { type: Number, default: 0, min: 0 },
+    /** Match bill date within +/- N days of birthday (month/day) */
+    birthdayBonusWindowDays: { type: Number, default: 0, min: 0, max: 15 },
+  },
+
+  // Prepaid messaging wallet (balance in paise; 100 paise = 1 rupee)
+  wallet: {
+    balancePaise: { type: Number, default: 0, min: 0 },
+  },
+
+  // Timestamps
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+}, {
+  timestamps: true
+});
+
+businessSchema.index({ status: 1, createdAt: -1 });
+businessSchema.index({ createdAt: -1 });
+businessSchema.index({ branchId: 1, createdAt: -1 });
+businessSchema.index({ 'subscription.plan': 1 });
+businessSchema.index({ name: 'text', code: 'text', 'contact.email': 'text' });
+
+// Generate unique business code
+businessSchema.pre('save', async function(next) {
+  if (!this.code) {
+    try {
+      this.code = await generateNextBusinessCode(this.constructor);
+    } catch (err) {
+      return next(err);
+    }
+  }
+  next();
+});
+
+// Export both schema and model for flexibility
+module.exports = {
+  schema: businessSchema,
+  model: mongoose.model('Business', businessSchema)
+};

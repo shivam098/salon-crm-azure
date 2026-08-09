@@ -1,0 +1,596 @@
+/**
+ * Shared helpers for GET /api/sales and GET /api/sales/summary — DB-side filters, pagination, aggregates.
+ */
+
+const { getStartOfDayIST, getEndOfDayIST } = require('../utils/date-utils');
+const { billChangeCreditedToWalletCashAddition } = require('../utils/bill-change-wallet-cash');
+const { saleGrossRevenue, saleNetRevenue } = require('./sale-revenue-metrics');
+const { allocateTipByPaymentModes } = require('./tip-payment-allocation');
+
+const DEFAULT_LIMIT = 100;
+const MAX_LIMIT = 10000;
+
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildLegacyPaymentModeMatch(mode) {
+  const safe = escapeRegex(mode);
+  return {
+    $or: [
+      { paymentMode: mode },
+      { paymentMode: { $regex: `^${safe}(,|\\s|$)`, $options: 'i' } },
+      { paymentMode: { $regex: `,\\s*${safe}(,|\\s|$)`, $options: 'i' } },
+    ],
+  };
+}
+
+/**
+ * @param {string} mode - Cash | Card | Online | Wallet | Reward Point
+ */
+function buildPaymentModeCondition(mode) {
+  if (!mode || mode === 'all') return null;
+
+  if (mode === 'Reward Point') {
+    return {
+      $or: [
+        { payments: { $elemMatch: { mode: { $in: ['Reward Point', 'Reward', 'reward'] } } } },
+        {
+          $and: [
+            { loyaltyPointsRedeemed: { $gt: 0 } },
+            { loyaltyDiscountAmount: { $gt: 0.005 } },
+          ],
+        },
+        {
+          $and: [
+            {
+              $or: [
+                { payments: { $exists: false } },
+                { payments: { $size: 0 } },
+              ],
+            },
+            buildLegacyPaymentModeMatch('Reward Point'),
+          ],
+        },
+        {
+          $and: [
+            {
+              $or: [
+                { payments: { $exists: false } },
+                { payments: { $size: 0 } },
+              ],
+            },
+            buildLegacyPaymentModeMatch('Reward'),
+          ],
+        },
+      ],
+    };
+  }
+
+  return {
+    $or: [
+      { payments: { $elemMatch: { mode } } },
+      {
+        $and: [
+          {
+            $or: [
+              { payments: { $exists: false } },
+              { payments: { $size: 0 } },
+            ],
+          },
+          buildLegacyPaymentModeMatch(mode),
+        ],
+      },
+    ],
+  };
+}
+
+function wantsDuePaymentDates(q) {
+  const { includeDuePaymentDates, forCashRegister } = q;
+  return (
+    includeDuePaymentDates === '1' ||
+    includeDuePaymentDates === 'true' ||
+    forCashRegister === '1' ||
+    forCashRegister === 'true'
+  );
+}
+
+/** Invoice `date` strictly outside the inclusive IST day range (complement of elemMatch + invoice range split). */
+function buildInvoiceDateOutsideRange(dateRange) {
+  const lo = dateRange.$gte;
+  const hi = dateRange.$lte;
+  if (lo != null && hi != null) {
+    return { $or: [{ date: { $lt: lo } }, { date: { $gt: hi } }] };
+  }
+  if (lo != null) return { date: { $lt: lo } };
+  if (hi != null) return { date: { $gt: hi } };
+  return null;
+}
+
+/**
+ * When cash-register / due-payment mode adds `$or` on invoice date vs paymentHistory.date, MongoDB often
+ * merges two IXSCANs and applies an in-memory sort. These two matches are disjoint and union to the same
+ * set as the `$or`; each uses a simpler filter + index.
+ * @returns {{ matchInvoice: object, matchPaymentOnly: object } | null}
+ */
+function buildSalesListDuePaymentSplitMatches(branchId, q) {
+  const {
+    date,
+    dateFrom,
+    dateTo,
+    status,
+    paymentMode,
+    search,
+    tipStaffId,
+  } = q;
+
+  let df = dateFrom || date;
+  let dt = dateTo || date;
+  if (date && !dateFrom && !dateTo) {
+    df = date;
+    dt = date;
+  }
+
+  if (!(df || dt) || !wantsDuePaymentDates(q)) return null;
+
+  const dateRange = {};
+  if (df) dateRange.$gte = getStartOfDayIST(df);
+  if (dt) dateRange.$lte = getEndOfDayIST(dt);
+
+  const outside = buildInvoiceDateOutsideRange(dateRange);
+  if (!outside) return null;
+
+  const parts = [{ branchId: branchId }];
+
+  if (status && status !== 'all') {
+    if (status === 'cancelled') {
+      parts.push({ status: { $in: ['cancelled', 'Cancelled'] } });
+    } else {
+      const st = String(status).toLowerCase();
+      const variants =
+        st === 'completed'
+          ? ['completed', 'Completed']
+          : st === 'partial'
+            ? ['partial', 'Partial']
+            : st === 'unpaid'
+              ? ['unpaid', 'Unpaid']
+              : [status];
+      parts.push({ status: { $in: variants } });
+    }
+  } else {
+    parts.push({ status: { $nin: ['cancelled', 'Cancelled'] } });
+  }
+
+  const tail = [];
+  const pm = buildPaymentModeCondition(paymentMode);
+  if (pm) tail.push(pm);
+
+  if (search && String(search).trim()) {
+    const re = escapeRegex(String(search).trim());
+    tail.push({
+      $or: [
+        { customerName: { $regex: re, $options: 'i' } },
+        { billNo: { $regex: re, $options: 'i' } },
+        { staffName: { $regex: re, $options: 'i' } },
+      ],
+    });
+  }
+
+  if (tipStaffId && tipStaffId !== 'all') {
+    const mongoose = require('mongoose');
+    const tid = mongoose.Types.ObjectId.isValid(tipStaffId)
+      ? new mongoose.Types.ObjectId(tipStaffId)
+      : tipStaffId;
+    tail.push({
+      $and: [
+        { tip: { $gt: 0 } },
+        {
+          $or: [{ tipStaffId: tid }, { tipLines: { $elemMatch: { staffId: tid } } }],
+        },
+      ],
+    });
+  }
+
+  const matchInvoice = { $and: [...parts, { date: dateRange }, ...tail] };
+  const matchPaymentOnly = {
+    $and: [
+      ...parts,
+      outside,
+      { paymentHistory: { $elemMatch: { date: dateRange } } },
+      ...tail,
+    ],
+  };
+
+  return { matchInvoice, matchPaymentOnly };
+}
+
+const SALES_LIST_SORT = { createdAt: -1, billNo: -1, _id: -1 };
+
+function saleSortKey(doc) {
+  const t = doc.createdAt ? new Date(doc.createdAt).getTime() : 0;
+  const bill = String(doc.billNo ?? '');
+  const id = String(doc._id ?? '');
+  return { t, bill, id };
+}
+
+/** True if a sorts before b in descending list order (a is "newer" first). */
+function salesListSortDesc(a, b) {
+  const ka = saleSortKey(a);
+  const kb = saleSortKey(b);
+  if (ka.t !== kb.t) return ka.t > kb.t;
+  if (ka.bill !== kb.bill) return ka.bill > kb.bill;
+  return ka.id > kb.id;
+}
+
+/**
+ * Paginated sales for due-payment split: two disjoint queries merged in app (no top-level `$or`).
+ * @param {import('mongoose').Model} Sale
+ */
+async function fetchSalesListPageMerged(Sale, matchInvoice, matchPaymentOnly, skip, limit) {
+  const cur1 = Sale.find(matchInvoice).sort(SALES_LIST_SORT).lean().cursor();
+  const cur2 = Sale.find(matchPaymentOnly).sort(SALES_LIST_SORT).lean().cursor();
+  let n1 = await cur1.next();
+  let n2 = await cur2.next();
+  let skipped = 0;
+  const out = [];
+  try {
+    while (out.length < limit && (n1 != null || n2 != null)) {
+      let pick;
+      if (n2 == null) pick = n1;
+      else if (n1 == null) pick = n2;
+      else pick = salesListSortDesc(n1, n2) ? n1 : n2;
+
+      if (pick === n1) n1 = await cur1.next();
+      else n2 = await cur2.next();
+
+      if (skipped < skip) {
+        skipped += 1;
+        continue;
+      }
+      out.push(pick);
+    }
+  } finally {
+    await cur1.close();
+    await cur2.close();
+  }
+  return out;
+}
+
+/**
+ * Build Mongo match for sales list / summary / count.
+ * @param {import('mongoose').Types.ObjectId} branchId
+ * @param {Record<string, string | undefined>} q - req.query
+ */
+function buildSalesListMatch(branchId, q) {
+  const {
+    date,
+    dateFrom,
+    dateTo,
+    status,
+    paymentMode,
+    search,
+    tipStaffId,
+    includeDuePaymentDates,
+    forCashRegister,
+  } = q;
+
+  let df = dateFrom || date;
+  let dt = dateTo || date;
+  if (date && !dateFrom && !dateTo) {
+    df = date;
+    dt = date;
+  }
+
+  const parts = [{ branchId: branchId }];
+
+  if (status && status !== 'all') {
+    if (status === 'cancelled') {
+      parts.push({ status: { $in: ['cancelled', 'Cancelled'] } });
+    } else {
+      const st = String(status).toLowerCase();
+      const variants =
+        st === 'completed'
+          ? ['completed', 'Completed']
+          : st === 'partial'
+            ? ['partial', 'Partial']
+            : st === 'unpaid'
+              ? ['unpaid', 'Unpaid']
+              : [status];
+      parts.push({ status: { $in: variants } });
+    }
+  } else {
+    parts.push({ status: { $nin: ['cancelled', 'Cancelled'] } });
+  }
+
+  if (df || dt) {
+    const dateRange = {};
+    if (df) dateRange.$gte = getStartOfDayIST(df);
+    if (dt) dateRange.$lte = getEndOfDayIST(dt);
+    const includeDues =
+      includeDuePaymentDates === '1' ||
+      includeDuePaymentDates === 'true' ||
+      forCashRegister === '1' ||
+      forCashRegister === 'true';
+    if (includeDues) {
+      // Cash register / payment-day analytics: include sales with due collections in range
+      // (paymentHistory.date), not only invoice date.
+      parts.push({
+        $or: [
+          { date: dateRange },
+          { paymentHistory: { $elemMatch: { date: dateRange } } },
+        ],
+      });
+    } else {
+      // Default (Sales report list): invoice date only — no extra rows when a due is paid later.
+      parts.push({ date: dateRange });
+    }
+  }
+
+  const pm = buildPaymentModeCondition(paymentMode);
+  if (pm) parts.push(pm);
+
+  if (search && String(search).trim()) {
+    const re = escapeRegex(String(search).trim());
+    parts.push({
+      $or: [
+        { customerName: { $regex: re, $options: 'i' } },
+        { billNo: { $regex: re, $options: 'i' } },
+        { staffName: { $regex: re, $options: 'i' } },
+      ],
+    });
+  }
+
+  if (tipStaffId && tipStaffId !== 'all') {
+    const mongoose = require('mongoose');
+    const tid = mongoose.Types.ObjectId.isValid(tipStaffId)
+      ? new mongoose.Types.ObjectId(tipStaffId)
+      : tipStaffId;
+    parts.push({
+      $and: [
+        { tip: { $gt: 0 } },
+        {
+          $or: [{ tipStaffId: tid }, { tipLines: { $elemMatch: { staffId: tid } } }],
+        },
+      ],
+    });
+  }
+
+  if (parts.length === 1) return parts[0];
+  return { $and: parts };
+}
+
+/**
+ * @param {Record<string, string>} query - req.query
+ * @returns {{ limit: number, page: number, skip: number }}
+ */
+function parseSalesListPagination(query) {
+  const limitRaw = parseInt(String(query.limit ?? ''), 10);
+  const limit = Number.isFinite(limitRaw) && limitRaw >= 1
+    ? Math.min(limitRaw, MAX_LIMIT)
+    : DEFAULT_LIMIT;
+  const page = Math.max(parseInt(String(query.page ?? ''), 10) || 1, 1);
+  const skip = (page - 1) * limit;
+  return { limit, page, skip };
+}
+
+/**
+ * Mark isEdited when BillEditHistory exists but sale document was not updated.
+ * @param {object[]} sales - lean docs
+ * @param {import('mongoose').Model} BillEditHistoryModel
+ */
+async function mergeEditedFlagsFromHistory(sales, BillEditHistoryModel) {
+  if (!BillEditHistoryModel || !sales.length) return;
+  const saleIds = sales.map((s) => s._id);
+  const editedIds = await BillEditHistoryModel.distinct('saleId', { saleId: { $in: saleIds } });
+  const set = new Set(editedIds.map((id) => id.toString()));
+  for (const sale of sales) {
+    if (!sale.isEdited && set.has(sale._id.toString())) {
+      sale.isEdited = true;
+    }
+  }
+}
+
+function getOutstandingBalance(sale) {
+  const rem = sale.paymentStatus?.remainingAmount;
+  if (typeof rem === 'number' && !Number.isNaN(rem)) return Math.max(0, rem);
+  const total = sale.grossTotal || 0;
+  const paid =
+    sale.paymentStatus?.paidAmount ??
+    (sale.payments || []).reduce((s, p) => s + (p.amount || 0), 0) ??
+    0;
+  return Math.max(0, total - paid);
+}
+
+function getSalePaidAmount(sale) {
+  const paid = sale.paymentStatus?.paidAmount;
+  if (typeof paid === 'number' && !Number.isNaN(paid)) return Math.max(0, paid);
+  if (sale.payments && sale.payments.length > 0) {
+    return sale.payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  }
+  return 0;
+}
+
+/** @see sale-revenue-metrics.js */
+function accumulateSaleSummary(sale, acc) {
+  const gross = saleGrossRevenue(sale);
+  const net = saleNetRevenue(sale);
+  acc.grossRevenue += gross;
+  acc.netRevenue += net;
+  acc.totalRevenue += net;
+  const tip = sale.tip || 0;
+  acc.tips += tip;
+  if (tip > 0.005) {
+    const split = allocateTipByPaymentModes(sale, tip);
+    acc.tipsCash += split.cash;
+    acc.tipsCard += split.card;
+    acc.tipsOnline += split.online;
+  }
+
+  const st = String(sale.status || '').toLowerCase();
+  if (st === 'completed') acc.completedSales += 1;
+  if (st === 'partial') acc.partialSales += 1;
+  if (st === 'unpaid') acc.unpaidSales += 1;
+  if (st === 'unpaid' || st === 'partial') {
+    acc.unpaidValue += getOutstandingBalance(sale);
+  }
+
+  let cashAmt = 0;
+  let isAllCash = false;
+  const paidAmount = getSalePaidAmount(sale);
+  if (sale.payments && sale.payments.length > 0) {
+    const cashPayments = sale.payments.filter((p) =>
+      String(p.mode || p.type || '')
+        .toLowerCase()
+        .includes('cash')
+    );
+    const hasNonCash = sale.payments.some((p) => {
+      const m = String(p.mode || p.type || '').toLowerCase();
+      return m.includes('card') || m.includes('online') || m.includes('upi');
+    });
+    cashAmt = cashPayments.reduce((s, p) => s + (p.amount || 0), 0);
+    isAllCash = cashAmt > 0 && !hasNonCash;
+  } else if (paidAmount > 0.005) {
+    const pm = String(sale.paymentMode || '').toLowerCase();
+    cashAmt =
+      pm.includes('cash') && !pm.includes('card') && !pm.includes('online')
+        ? paidAmount
+        : 0;
+    isAllCash = cashAmt > 0;
+  }
+  const walletCashAdd = billChangeCreditedToWalletCashAddition(sale);
+  cashAmt += walletCashAdd;
+  const tipDeduction = isAllCash ? tip : 0;
+  acc.cashCollected += cashAmt - tipDeduction;
+  acc.walletCashCollected += walletCashAdd;
+  acc.serviceCashCollected += cashAmt - walletCashAdd - tipDeduction;
+
+  if (sale.payments && sale.payments.length > 0) {
+    sale.payments.forEach((p) => {
+      const amt = p.amount || 0;
+      if (p.mode === 'Card') {
+        acc.cardCollected += amt;
+        acc.onlineCash += amt;
+      } else if (p.mode === 'Online') {
+        acc.onlinePayCollected += amt;
+        acc.onlineCash += amt;
+      }
+    });
+  } else if (paidAmount > 0.005 && sale.paymentMode === 'Card') {
+    acc.cardCollected += paidAmount;
+    acc.onlineCash += paidAmount;
+  } else if (paidAmount > 0.005 && sale.paymentMode === 'Online') {
+    acc.onlinePayCollected += paidAmount;
+    acc.onlineCash += paidAmount;
+  }
+}
+
+/**
+ * Stream all matching sales (projection) and compute summary — memory-safe via cursor.
+ * @param {import('mongoose').Model} Sale
+ * @param {object} match
+ * @returns {Promise<object>}
+ */
+async function computeSalesSummaryTotals(Sale, match) {
+  const projection = {
+    grossTotal: 1,
+    loyaltyDiscountAmount: 1,
+    receiptTotalsBreakdown: 1,
+    payments: 1,
+    paymentMode: 1,
+    tip: 1,
+    tipPaymentMode: 1,
+    paymentHistory: 1,
+    status: 1,
+    paymentStatus: 1,
+    billChangeCreditedToWallet: 1,
+  };
+  const acc = {
+    grossRevenue: 0,
+    netRevenue: 0,
+    totalRevenue: 0,
+    cashCollected: 0,
+    serviceCashCollected: 0,
+    walletCashCollected: 0,
+    onlineCash: 0,
+    cardCollected: 0,
+    onlinePayCollected: 0,
+    unpaidValue: 0,
+    tips: 0,
+    tipsCash: 0,
+    tipsCard: 0,
+    tipsOnline: 0,
+    completedSales: 0,
+    partialSales: 0,
+    unpaidSales: 0,
+  };
+  const cursor = Sale.find(match).select(projection).lean().cursor();
+  for await (const doc of cursor) {
+    accumulateSaleSummary(doc, acc);
+  }
+  return acc;
+}
+
+/**
+ * Same totals as {@link computeSalesSummaryTotals} for the union of two disjoint matches (due-payment split).
+ */
+async function computeSalesSummaryTotalsSplit(Sale, matchInvoice, matchPaymentOnly) {
+  const projection = {
+    grossTotal: 1,
+    loyaltyDiscountAmount: 1,
+    receiptTotalsBreakdown: 1,
+    payments: 1,
+    paymentMode: 1,
+    tip: 1,
+    tipPaymentMode: 1,
+    paymentHistory: 1,
+    status: 1,
+    paymentStatus: 1,
+    billChangeCreditedToWallet: 1,
+  };
+  const acc = {
+    grossRevenue: 0,
+    netRevenue: 0,
+    totalRevenue: 0,
+    cashCollected: 0,
+    serviceCashCollected: 0,
+    walletCashCollected: 0,
+    onlineCash: 0,
+    cardCollected: 0,
+    onlinePayCollected: 0,
+    unpaidValue: 0,
+    tips: 0,
+    tipsCash: 0,
+    tipsCard: 0,
+    tipsOnline: 0,
+    completedSales: 0,
+    partialSales: 0,
+    unpaidSales: 0,
+  };
+  for (const match of [matchInvoice, matchPaymentOnly]) {
+    const cursor = Sale.find(match).select(projection).lean().cursor();
+    for await (const doc of cursor) {
+      accumulateSaleSummary(doc, acc);
+    }
+  }
+  return acc;
+}
+
+/**
+ * @deprecated Use buildSalesListMatch — kept for any internal caller expecting old signature
+ */
+function buildSalesListFilter(branchId, dateFrom, dateTo) {
+  return buildSalesListMatch(branchId, { dateFrom, dateTo });
+}
+
+module.exports = {
+  buildSalesListFilter,
+  buildSalesListMatch,
+  buildSalesListDuePaymentSplitMatches,
+  fetchSalesListPageMerged,
+  computeSalesSummaryTotalsSplit,
+  parseSalesListPagination,
+  mergeEditedFlagsFromHistory,
+  computeSalesSummaryTotals,
+  DEFAULT_LIMIT,
+  MAX_LIMIT,
+};

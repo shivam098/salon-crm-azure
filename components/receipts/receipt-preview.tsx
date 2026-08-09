@@ -1,0 +1,356 @@
+"use client"
+
+import { useEffect } from "react"
+import type { Receipt } from "@/lib/data"
+import { getReceiptSettlementSummary } from "@/lib/receipt-settlement-summary"
+import { formatReceiptRefundModeLabel } from "@/lib/receipt-refunds"
+import { formatPaymentRecordedDateLabelFromIso } from "@/lib/sale-payment-lines"
+import { receiptPaymentTypeDisplayName } from "@/lib/sale-payment-lines"
+import { getReceiptPaymentStamp } from "@/lib/receipt-payment-stamp"
+import { formatReceiptDiscountPercent } from "@/lib/receipt-discount-format"
+import { formatReceiptItemStaffNames } from "@/lib/receipt-staff-format"
+import { receiptWalkInSaleLabel } from "@/lib/receipt-line-source"
+import { receiptTipDisplayLines } from "@/lib/receipt-tip-lines"
+import { ReceiptTotalsSection, ReceiptGrandTotalRow } from "@/components/receipts/receipt-totals-section"
+import { getReceiptPreviewClassName, resolveReceiptPaperSize } from "@/lib/receipt-paper-size"
+import { cn } from "@/lib/utils"
+import { Card, CardContent } from "@/components/ui/card"
+import { useCurrency } from "@/hooks/use-currency"
+import { shouldShowGstOnClientReceipt } from "@/lib/should-show-gst-on-client-receipt"
+
+interface ReceiptPreviewProps {
+  receipt: Receipt
+  businessSettings?: any
+}
+
+export function ReceiptPreview({ receipt, businessSettings }: ReceiptPreviewProps) {
+  const { formatAmount } = useCurrency()
+  
+  // Debug logging
+  useEffect(() => {
+    console.log('🔍 ReceiptPreview - receipt data:', receipt)
+    console.log('🔍 ReceiptPreview - payments:', receipt.payments)
+  }, [receipt])
+  
+  const settlement = getReceiptSettlementSummary(receipt)
+  const total = settlement.billTotal
+  const stamp = getReceiptPaymentStamp(receipt as any, total)
+  const paymentStatus = stamp.label
+  const stampColor = stamp.color
+
+  const taxBreakdownNode =
+    receipt.tax > 0 ? (
+      receipt.taxBreakdown ? (
+        <div className="space-y-1">
+          {receipt.taxBreakdown.serviceTax > 0 && (
+            <div className="ml-2 space-y-1">
+              <div className="flex justify-between text-xs">
+                <span>Service Tax ({receipt.taxBreakdown.serviceRate}%):</span>
+                <span>{formatAmount(receipt.taxBreakdown.serviceTax)}</span>
+              </div>
+              <div className="flex justify-between text-xs ml-2">
+                <span>CGST ({receipt.taxBreakdown.serviceRate / 2}%):</span>
+                <span>{formatAmount(receipt.taxBreakdown.serviceTax / 2)}</span>
+              </div>
+              <div className="flex justify-between text-xs ml-2">
+                <span>SGST ({receipt.taxBreakdown.serviceRate / 2}%):</span>
+                <span>{formatAmount(receipt.taxBreakdown.serviceTax / 2)}</span>
+              </div>
+            </div>
+          )}
+          {receipt.taxBreakdown.productTaxByRate &&
+            Object.entries(receipt.taxBreakdown.productTaxByRate).map(([rate, amount]) =>
+              amount > 0 ? (
+                <div key={rate} className="ml-2 space-y-1">
+                  <div className="flex justify-between text-xs">
+                    <span>Product Tax ({rate}%):</span>
+                    <span>{formatAmount(amount)}</span>
+                  </div>
+                  <div className="flex justify-between text-xs ml-2">
+                    <span>CGST ({parseFloat(rate) / 2}%):</span>
+                    <span>{formatAmount(amount / 2)}</span>
+                  </div>
+                  <div className="flex justify-between text-xs ml-2">
+                    <span>SGST ({parseFloat(rate) / 2}%):</span>
+                    <span>{formatAmount(amount / 2)}</span>
+                  </div>
+                </div>
+              ) : null
+            )}
+        </div>
+      ) : (
+        <div className="space-y-1">
+          <div className="flex justify-between text-xs ml-2">
+            <span>CGST (2.5%):</span>
+            <span>{formatAmount(receipt.tax / 2)}</span>
+          </div>
+          <div className="flex justify-between text-xs ml-2">
+            <span>SGST (2.5%):</span>
+            <span>{formatAmount(receipt.tax / 2)}</span>
+          </div>
+        </div>
+      )
+    ) : null
+
+  // Custom receipt template (only present when the business plan includes the
+  // `custom_receipt_templates` feature; backend strips it otherwise).
+  const tpl = businessSettings?.receiptTemplate || {}
+  const showLogo = tpl.showLogo !== false
+  const showGst = shouldShowGstOnClientReceipt(businessSettings)
+  const paperSize = resolveReceiptPaperSize(businessSettings)
+
+  return (
+    <Card className={cn("bg-white relative", getReceiptPreviewClassName(paperSize))}>
+      <CardContent className="p-6 font-mono text-sm">
+        {/* Header */}
+        <div className="text-center border-b-2 border-black pb-3 mb-4">
+          {/* Logo */}
+          {showLogo && businessSettings?.logo && (
+            <div className="mb-3">
+              <img 
+                src={businessSettings.logo} 
+                alt="Business Logo" 
+                className="mx-auto h-16 w-16 object-contain"
+              />
+            </div>
+          )}
+          <div className="text-lg font-bold mb-1">
+            {businessSettings?.name || "GLAMOUR SALON & SPA"}
+          </div>
+          <div className="text-xs">
+            {businessSettings 
+              ? `${businessSettings.address}, ${businessSettings.city}, ${businessSettings.state} ${businessSettings.zipCode}`
+              : "123 Beauty Street, City, ST 12345"
+            }
+          </div>
+          <div className="text-xs">
+            Phone: {businessSettings?.phone || "(555) 123-SALON"}
+          </div>
+          <div className="text-xs">
+            Email: {businessSettings?.email || "info@glamoursalon.com"}
+          </div>
+          {showGst && businessSettings?.gstNumber && (
+            <div className="text-xs font-semibold mt-1">
+              GST: {businessSettings.gstNumber}
+            </div>
+          )}
+          {tpl.headerText && (
+            <div className="text-xs mt-2 whitespace-pre-line">{tpl.headerText}</div>
+          )}
+        </div>
+
+        {/* Receipt Info */}
+        <div className="mb-4 space-y-1">
+          <div className="flex justify-between">
+            <span className="font-semibold">Receipt #:</span>
+            <span>{receipt.receiptNumber}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="font-semibold">Date:</span>
+            <span>{new Date(receipt.date).toLocaleDateString()}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="font-semibold">Time:</span>
+            <span>{receipt.time}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="font-semibold">Client:</span>
+            <span>{receipt.clientName}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="font-semibold">Phone:</span>
+            <span>{receipt.clientPhone}</span>
+          </div>
+        </div>
+
+        {/* Items - Table: HSN, Service/Product, Price, Disc(%), Tax Rate, Total */}
+        <div className="border-t border-b border-dashed border-black py-3 mb-3 overflow-x-hidden">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-black">
+                <th className="text-left py-1 font-semibold">HSN</th>
+                <th className="text-left py-1 font-semibold">Service/Product</th>
+                <th className="text-right py-1 font-semibold">Price</th>
+                <th className="text-right py-1 font-semibold">Disc(%)</th>
+                <th className="text-right py-1 font-semibold">Tax Rate</th>
+                <th className="text-right py-1 font-semibold">Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {receipt.items.map((item, index) => (
+                <tr key={index} className="border-b border-dashed border-gray-300 last:border-0">
+                  <td className="py-1.5">{item.hsnSacCode || "-"}</td>
+                  <td className="py-1.5">
+                    <span className="font-medium">{item.name}</span>
+                    {item.quantity > 1 && (
+                      <span className="text-xs text-gray-600 ml-1">(x{item.quantity})</span>
+                    )}
+                    {(() => {
+                      const staffLabel = formatReceiptItemStaffNames(item)
+                      const walkInLabel = receiptWalkInSaleLabel(item.lineSource)
+                      return (
+                        <>
+                          {staffLabel ? (
+                            <span className="block text-xs text-gray-600">{staffLabel}</span>
+                          ) : null}
+                          {walkInLabel ? (
+                            <span className="block text-xs text-amber-800 font-medium">{walkInLabel}</span>
+                          ) : null}
+                        </>
+                      )
+                    })()}
+                  </td>
+                  <td className="py-1.5 text-right">{formatAmount(item.price)}</td>
+                  <td className="py-1.5 text-right">
+                    {(item.discount || 0) > 0
+                      ? item.discountType === "percentage"
+                        ? formatReceiptDiscountPercent(item.discount)
+                        : formatAmount(item.discount)
+                      : "-"}
+                  </td>
+                  <td className="py-1.5 text-right">{((item as any).taxRate ?? 0) > 0 ? `${(item as any).taxRate}%` : "-"}</td>
+                  <td className="py-1.5 text-right font-medium">{formatAmount(item.total)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Totals */}
+        <ReceiptTotalsSection
+          receipt={receipt}
+          formatAmount={formatAmount}
+          taxBreakdown={taxBreakdownNode}
+        />
+        {receipt.tip > 0 &&
+          receiptTipDisplayLines(receipt).length > 1 &&
+          receiptTipDisplayLines(receipt).map((line, i) => (
+            <div key={i} className="flex justify-between text-sm -mt-2 mb-2 ml-2">
+              <span>{line.staffName ? `Tip (${line.staffName}):` : "Tip:"}</span>
+              <span>{formatAmount(line.amount)}</span>
+            </div>
+          ))}
+        <ReceiptGrandTotalRow
+          receipt={receipt}
+          formatAmount={formatAmount}
+          amount={settlement.billTotal}
+        />
+        <div className="space-y-1 mb-4">
+          {settlement.showReceivedAndAdjusted && (
+            <div className="space-y-1 text-sm mt-3 pt-1 border-t border-dashed border-black/30">
+              <div className="flex justify-between">
+                <span>Amount Received:</span>
+                <span className="tabular-nums">{formatAmount(settlement.amountReceived)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Adjusted:</span>
+                <span className="tabular-nums">{formatAmount(settlement.paidTowardBill)}</span>
+              </div>
+              {settlement.showWalletCreditLine && (
+                <div className="flex justify-between">
+                  <span>Wallet Credit:</span>
+                  <span className="tabular-nums">{formatAmount(settlement.walletCredit)}</span>
+                </div>
+              )}
+              {settlement.showOutstandingLine && (
+                <div className="flex justify-between text-red-600 font-medium">
+                  <span>Outstanding:</span>
+                  <span className="tabular-nums">{formatAmount(settlement.outstanding)}</span>
+                </div>
+              )}
+            </div>
+          )}
+          <div className="flex justify-between text-sm mt-3 font-semibold pt-2 border-t border-black/20">
+            <span>Total Paid (Bill):</span>
+            <span className="tabular-nums">{formatAmount(settlement.effectivePaidTowardBill)}</span>
+          </div>
+        </div>
+
+        {/* Payments */}
+        <div className="mb-4">
+          <div className="font-semibold mb-2">Payment Method(s):</div>
+          {receipt.payments.map((payment, index) => {
+            // Safely handle payment types with null/undefined checks
+            if (!payment || !payment.type) {
+              console.warn(`Payment at index ${index} is missing type:`, payment)
+              return (
+                <div key={index} className="flex justify-between">
+                  <span>Unknown:</span>
+                  <span>{formatAmount(payment?.amount || 0)}</span>
+                </div>
+              )
+            }
+            
+            const displayName = receiptPaymentTypeDisplayName(payment.type)
+            const dateLabel = formatPaymentRecordedDateLabelFromIso(payment.recordedAt)
+            return (
+              <div key={index} className="flex justify-between">
+                <span>
+                  {displayName}
+                  {dateLabel ? ` (${dateLabel})` : ""}:
+                </span>
+                <span>{formatAmount(payment.amount)}</span>
+              </div>
+            )
+          })}
+        </div>
+
+        {settlement.showRefundsSection && (
+          <div className="mb-4">
+            <div className="font-semibold mb-2">Refund(s):</div>
+            {settlement.refundLines.map((refund, index) => {
+              const mode = formatReceiptRefundModeLabel(refund.mode)
+              const dateSuffix = refund.dateLabel ? ` (${refund.dateLabel})` : ""
+              return (
+                <div key={index} className="flex justify-between text-amber-800 font-medium">
+                  <span>
+                    Refund ({mode}){dateSuffix}:
+                  </span>
+                  <span className="tabular-nums">{formatAmount(refund.amount)}</span>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {/* Footer */}
+        <div className="text-center border-t border-dashed border-black pt-3 text-xs">
+          {tpl.footerText ? (
+            <div className="whitespace-pre-line">{tpl.footerText}</div>
+          ) : (
+            <>
+              <div>Thank you for visiting!</div>
+              <div>We appreciate your business</div>
+            </>
+          )}
+          <div className="mt-2">
+            Follow us on social media
+            <br />
+            {businessSettings?.socialMedia || "@glamoursalon"}
+          </div>
+        </div>
+
+        {/* Payment Status Stamp */}
+        <div
+          className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 -rotate-12 select-none print:opacity-100"
+          style={{
+            border: `2px solid ${stampColor}`,
+            color: stampColor,
+            padding: "6px 12px",
+            fontSize: "14px",
+            fontWeight: 700,
+            letterSpacing: "0.05em",
+            opacity: 0.85,
+            boxShadow: "0 1px 3px rgba(0,0,0,0.15)",
+            borderRadius: "4px",
+            printColorAdjust: "exact",
+            WebkitPrintColorAdjust: "exact",
+          }}
+        >
+          {stamp.checkPrefix}
+          {paymentStatus}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}

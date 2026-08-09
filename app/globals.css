@@ -1,0 +1,624 @@
+@import "../styles/dark-mode-compat.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+@layer components {
+  /* Custom animations for dashboard */
+  .animate-in {
+    animation-fill-mode: both;
+  }
+  
+  .slide-in-from-bottom-2 {
+    animation: slideInFromBottom 0.5s ease-out;
+  }
+  
+  .slide-in-from-left-2 {
+    animation: slideInFromLeft 0.5s ease-out;
+  }
+  
+  .fade-in {
+    animation: fadeIn 0.6s ease-out;
+  }
+  
+  .scale-in {
+    animation: scaleIn 0.4s ease-out;
+  }
+  
+  .bounce-in {
+    animation: bounceIn 0.6s ease-out;
+  }
+  
+  /* Top navigation animations */
+  .nav-item-hover {
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  
+  .nav-item-hover:hover {
+    transform: translateY(-2px);
+  }
+  
+  .dropdown-enter {
+    animation: dropdownEnter 0.2s ease-out;
+  }
+  
+  .button-glow {
+    transition: all 0.3s ease;
+  }
+  
+  .button-glow:hover {
+    box-shadow: 0 0 20px rgba(99, 102, 241, 0.3);
+  }
+  
+  /* Business name component animations */
+  .business-name-glow {
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  
+  .business-name-glow:hover {
+    box-shadow: 0 4px 20px rgba(99, 102, 241, 0.2);
+  }
+  
+  .dot-pulse {
+    animation: dotPulse 2s infinite;
+  }
+  
+  .dot-bounce {
+    animation: dotBounce 0.6s ease-in-out;
+  }
+  
+  .dot-ping {
+    animation: dotPing 1s cubic-bezier(0, 0, 0.2, 1) infinite;
+  }
+
+  /* Father's Day top-nav banner */
+  .fathers-day-banner-gradient {
+    background: linear-gradient(
+      105deg,
+      #0f172a 0%,
+      #1e3a5f 22%,
+      #172554 45%,
+      #1a2744 68%,
+      #0f172a 100%
+    );
+    background-size: 220% 100%;
+    animation: fathersDayGradientShift 10s ease-in-out infinite;
+  }
+
+  .fathers-day-text-shimmer {
+    background: linear-gradient(
+      90deg,
+      #fde68a 0%,
+      #fef3c7 35%,
+      #fcd34d 50%,
+      #fef3c7 65%,
+      #fde68a 100%
+    );
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: fathersDayTextShimmer 4s linear infinite;
+  }
+
+  .fathers-day-float {
+    animation: fathersDayFloat 3s ease-in-out infinite;
+  }
+
+  .fathers-day-float-delay {
+    animation-delay: 1.2s;
+  }
+
+  .fathers-day-sparkle {
+    animation: fathersDaySparkle 2.4s ease-in-out infinite;
+  }
+
+  .fathers-day-sparkle-delay-1 {
+    animation-delay: 0.4s;
+  }
+
+  .fathers-day-sparkle-delay-2 {
+    animation-delay: 0.9s;
+  }
+
+  .fathers-day-sparkle-delay-3 {
+    animation-delay: 1.5s;
+  }
+
+  .fathers-day-pulse {
+    animation: fathersDayPulse 2s ease-in-out infinite;
+  }
+
+  .fathers-day-pulse-delay {
+    animation-delay: 1s;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .fathers-day-banner-gradient,
+    .fathers-day-text-shimmer,
+    .fathers-day-float,
+    .fathers-day-sparkle,
+    .fathers-day-pulse,
+    .fathers-day-nav .animate-gold-sheen {
+      animation: none !important;
+    }
+
+    .fathers-day-text-shimmer {
+      color: #fde68a;
+      background: none;
+      -webkit-background-clip: unset;
+      background-clip: unset;
+    }
+  }
+
+  /* Schedule grid layout transition */
+  .schedule-grid-transition {
+    transition: grid-template-columns 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  /* Category scrollbar styling */
+  .category-scroll-container {
+    scrollbar-width: thin;
+    scrollbar-color: #cbd5e1 #f1f5f9;
+    /* Ensure mouse wheel scrolling works */
+    overscroll-behavior: contain;
+  }
+
+  .category-scroll-container::-webkit-scrollbar {
+    width: 8px;
+    display: block;
+  }
+
+  .category-scroll-container::-webkit-scrollbar-track {
+    background: #f1f5f9;
+    border-radius: 4px;
+  }
+
+  .category-scroll-container::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 4px;
+  }
+
+  .category-scroll-container::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+  }
+
+  /* Ensure scrollbar is always visible when content overflows */
+  .category-scroll-container:not(:hover)::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+  }
+}
+
+@keyframes slideInFromBottom {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideInFromLeft {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slideInFromRight {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Exciting reveal for dynamic form fields */
+@keyframes fieldReveal {
+  0% {
+    opacity: 0;
+    transform: translateX(16px) scale(0.96);
+  }
+  60% {
+    opacity: 1;
+    transform: translateX(-2px) scale(1.02);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+.slide-in-from-right-reveal {
+  animation: fieldReveal 0.45s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes bounceIn {
+  0% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.05);
+  }
+  70% {
+    transform: scale(0.9);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes dropdownEnter {
+  from {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes fathersDayGradientShift {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+@keyframes fathersDayTextShimmer {
+  0% {
+    background-position: 200% center;
+  }
+  100% {
+    background-position: -200% center;
+  }
+}
+
+@keyframes fathersDayFloat {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-4deg);
+  }
+  50% {
+    transform: translateY(-3px) rotate(4deg);
+  }
+}
+
+@keyframes fathersDaySparkle {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+}
+
+@keyframes fathersDayPulse {
+  0%,
+  100% {
+    opacity: 0.65;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+@keyframes dotPulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.7;
+    transform: scale(1.1);
+  }
+}
+
+@keyframes dotBounce {
+  0%, 20%, 53%, 80%, 100% {
+    transform: translateY(0);
+  }
+  40%, 43% {
+    transform: translateY(-8px);
+  }
+  70% {
+    transform: translateY(-4px);
+  }
+  90% {
+    transform: translateY(-2px);
+  }
+}
+
+@keyframes dotPing {
+  75%, 100% {
+    transform: scale(2);
+    opacity: 0;
+  }
+}
+
+/* Calendar premium animations */
+@keyframes timeDotPulse {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.4);
+  }
+  50% {
+    opacity: 0.9;
+    box-shadow: 0 0 0 6px rgba(220, 38, 38, 0);
+  }
+}
+
+@keyframes calendarFadeIn {
+  from {
+    opacity: 0.6;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-time-dot-pulse {
+  animation: timeDotPulse 2s ease-in-out infinite;
+}
+
+.calendar-fade-transition {
+  animation: calendarFadeIn 0.25s ease-out;
+}
+
+/* Appointment card premium entrance */
+@keyframes appointmentCardEnter {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-appointment-card-enter {
+  animation: appointmentCardEnter 0.14s ease-out forwards;
+}
+
+@keyframes navigation-progress {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+
+/* Toast auto-dismiss countdown bar — shrinks left-to-right via scaleX. */
+@keyframes toast-progress {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+/* Appointments calendar grid — theme tokens for inline slot fills & guides */
+.appointments-calendar-surface {
+  --cal-cell-base: 255 255 255;
+  --cal-cell-muted: 248 250 252;
+  --cal-cell-outside-in: 226 232 240;
+  --cal-cell-alt: 248 250 252;
+  --cal-cell-current-hour: 255 251 235;
+  --cal-slot-menu: 245 243 255;
+  --cal-drag-valid: 91 33 182;
+  --cal-drag-invalid: 153 27 27;
+  --cal-guide-1: 203 213 225;
+  --cal-guide-2: 226 232 240;
+  --cal-hover-slot: 237 233 254;
+  --cal-header-shadow: 0 0 0;
+}
+
+.dark .appointments-calendar-surface {
+  --cal-cell-base: 15 23 42;
+  --cal-cell-muted: 30 41 59;
+  --cal-cell-outside-in: 51 65 85;
+  --cal-cell-alt: 30 41 59;
+  --cal-cell-current-hour: 69 26 3;
+  --cal-slot-menu: 46 16 101;
+  --cal-drag-valid: 124 58 237;
+  --cal-drag-invalid: 220 38 38;
+  --cal-guide-1: 71 85 105;
+  --cal-guide-2: 51 65 85;
+  --cal-hover-slot: 76 29 149;
+  --cal-header-shadow: 255 255 255;
+}
+
+.calendar-staff-header-shadow {
+  box-shadow: 0 1px 0 0 rgb(var(--cal-header-shadow) / 0.05);
+}
+
+/* Outside working hours (per staff) — tint comes from inline layered backgrounds with 5-min guides */
+.calendar-outside-hours {
+  color: rgb(148 163 184) !important;
+  border-right-color: rgb(203 213 225) !important;
+  border-bottom-color: rgb(203 213 225) !important;
+}
+
+.dark .calendar-outside-hours {
+  color: rgb(100 116 139) !important;
+  border-right-color: rgb(51 65 85) !important;
+  border-bottom-color: rgb(51 65 85) !important;
+}
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 0 0% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 3.9%;
+    --primary: 0 0% 9%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 0 0% 96.1%;
+    --secondary-foreground: 0 0% 9%;
+    --muted: 0 0% 96.1%;
+    --muted-foreground: 0 0% 45.1%;
+    --accent: 0 0% 96.1%;
+    --accent-foreground: 0 0% 9%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 89.8%;
+    --input: 0 0% 89.8%;
+    --ring: 0 0% 3.9%;
+    --chart-1: 12 76% 61%;
+    --chart-2: 173 58% 39%;
+    --chart-3: 197 37% 24%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 27 87% 67%;
+    --radius: 0.5rem;
+    --cell-size: 2rem;
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+  .dark {
+    --background: 0 0% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 0 0% 3.9%;
+    --card-foreground: 0 0% 98%;
+    --popover: 0 0% 3.9%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 0 0% 9%;
+    --secondary: 0 0% 14.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 0 0% 14.9%;
+    --muted-foreground: 0 0% 63.9%;
+    --accent: 0 0% 14.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 14.9%;
+    --input: 0 0% 14.9%;
+    --ring: 0 0% 83.1%;
+    --chart-1: 220 70% 50%;
+    --chart-2: 160 60% 45%;
+    --chart-3: 30 80% 55%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 75% 55%;
+    --sidebar-background: 240 5.9% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Quick-add nav shortcuts — custom hover (Tailwind from-blue-50 + bg-gradient is stripped in dark-mode-compat). */
+.quick-add-menu-item {
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.quick-add-menu-item:hover,
+.quick-add-menu-item:focus,
+.quick-add-menu-item[data-highlighted] {
+  background-image: linear-gradient(to right, rgb(239 246 255), rgb(238 242 255)) !important;
+  background-color: transparent !important;
+  color: hsl(var(--foreground)) !important;
+}
+
+html.dark .quick-add-menu-item:hover,
+html.dark .quick-add-menu-item:focus,
+html.dark .quick-add-menu-item[data-highlighted] {
+  background-image: none !important;
+  background-color: hsl(217 91% 60% / 0.3) !important;
+  color: hsl(var(--foreground)) !important;
+}
+
+.quick-add-menu-item:hover .quick-add-menu-icon,
+.quick-add-menu-item:focus .quick-add-menu-icon,
+.quick-add-menu-item[data-highlighted] .quick-add-menu-icon {
+  background-color: rgb(191 219 254) !important;
+}
+
+html.dark .quick-add-menu-item:hover .quick-add-menu-icon,
+html.dark .quick-add-menu-item:focus .quick-add-menu-icon,
+html.dark .quick-add-menu-item[data-highlighted] .quick-add-menu-icon {
+  background-color: hsl(217 91% 60% / 0.38) !important;
+}
+
+.quick-add-menu-item:hover .quick-add-menu-icon-svg,
+.quick-add-menu-item:focus .quick-add-menu-icon-svg,
+.quick-add-menu-item[data-highlighted] .quick-add-menu-icon-svg {
+  color: rgb(29 78 216) !important;
+}
+
+html.dark .quick-add-menu-item:hover .quick-add-menu-icon-svg,
+html.dark .quick-add-menu-item:focus .quick-add-menu-icon-svg,
+html.dark .quick-add-menu-item[data-highlighted] .quick-add-menu-icon-svg {
+  color: rgb(147 197 253) !important;
+}

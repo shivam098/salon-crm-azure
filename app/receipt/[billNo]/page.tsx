@@ -1,0 +1,570 @@
+"use client"
+
+import { useEffect, useMemo, useState } from "react"
+import { useParams, useSearchParams } from "next/navigation"
+import { ProtectedRoute } from "@/components/auth/protected-route"
+import { ProtectedLayout } from "@/components/layout/protected-layout"
+import { ReceiptTemplateView, printReceiptWithTemplate } from "@/components/receipts/receipt-template-view"
+import { ReceiptPrintStyles } from "@/components/receipts/receipt-print-styles"
+import { Button } from "@/components/ui/button"
+import { Printer, ArrowLeft, MessageCircle, Package } from "lucide-react"
+import Link from "next/link"
+import { SettingsAPI } from "@/lib/api"
+import { SalesAPI } from "@/lib/api"
+import { useToast } from "@/hooks/use-toast"
+import { buildReceiptPaymentsWithLegacyFallback } from "@/lib/sale-payment-lines"
+import { formatSaleTimeForDisplay } from "@/lib/sale-datetime-format"
+import { receiptPreviewFromBillPageData } from "@/lib/receipt-preview-from-sale-api"
+import { RecordConsumptionDialog } from "@/components/bills/record-consumption-dialog"
+import { canShowRecordConsumptionCta } from "@/lib/record-consumption-cta"
+
+interface ReceiptData {
+  id: string
+  billNo: string
+  customerName: string
+  customerPhone: string
+  date: string
+  time: string
+  items: Array<{
+    name: string
+    type: string
+    quantity: number
+    price: number
+    total: number
+    discount?: number
+    discountType?: string
+    staffName?: string
+    staffContributions?: Array<{ staffId?: string; staffName?: string; percentage?: number; amount?: number }>
+    hsnSacCode?: string
+    taxAmount?: number
+    priceExcludingGST?: number
+    taxRate?: number
+  }>
+  netTotal: number
+  taxAmount: number
+  grossTotal: number
+  subtotalExcludingTax?: number
+  tip: number
+  tipStaffName?: string
+  tipLines?: Array<{ staffName?: string; amount: number }>
+  paymentMode: string
+  payments: Array<{
+    type: string
+    amount: number
+    recordedAt?: string
+  }>
+  staffName: string
+  status: string
+  invoiceDeleted?: boolean
+  taxBreakdown?: {
+    serviceTax: number
+    serviceRate: number
+    productTaxByRate: { [rate: string]: number }
+  }
+  shareToken?: string
+  /** Excess cash credited to prepaid wallet (POS); amount in ₹ */
+  billChangeCreditedToWallet?: number
+  walletRefundCredited?: number
+  refundHistory?: Array<{
+    amount?: number
+    mode?: string
+    date?: string
+    editReason?: string
+  }>
+  paymentStatus?: {
+    paidAmount?: number
+    totalAmount?: number
+    remainingAmount?: number
+  }
+  discount?: number
+  discountType?: string
+  loyaltyDiscountAmount?: number
+  receiptTotalsBreakdown?: import("@/lib/data").ReceiptTotalsBreakdown
+}
+
+export default function ReceiptPage() {
+  const params = useParams()
+  const searchParams = useSearchParams()
+  const [receipt, setReceipt] = useState<ReceiptData | null>(null)
+  const [businessSettings, setBusinessSettings] = useState<any>(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [consumptionDialogOpen, setConsumptionDialogOpen] = useState(false)
+  const { toast } = useToast()
+
+  // Load business settings
+  useEffect(() => {
+    const loadBusinessSettings = async () => {
+      try {
+        console.log('Loading business settings for receipt...')
+        const response = await SettingsAPI.getBusinessSettings()
+        console.log('Business settings response:', response)
+        if (response.success) {
+          setBusinessSettings(response.data)
+          console.log('Business settings loaded:', response.data)
+        }
+      } catch (error) {
+        console.error('Error loading business settings:', error)
+      }
+    }
+
+    loadBusinessSettings()
+  }, [])
+
+  // Load receipt data by bill number
+  useEffect(() => {
+    const loadReceipt = async () => {
+      try {
+        const billNo = params.billNo as string
+        
+        console.log('🎯 Receipt Page Debug:')
+        console.log('Bill Number:', billNo)
+        
+        if (!billNo) {
+          setError('Bill number is required')
+          setIsLoading(false)
+          return
+        }
+
+        // First, try to use data from query parameters (has correct taxBreakdown)
+        try {
+          const dataParam = searchParams.get('data')
+          if (dataParam) {
+            console.log('🔄 Using query parameter data (has correct taxBreakdown)...')
+            const frontendData = JSON.parse(decodeURIComponent(dataParam))
+            console.log('📋 Frontend data:', frontendData)
+            console.log('📋 Frontend taxBreakdown:', frontendData.taxBreakdown)
+            console.log('📋 Frontend payments:', frontendData.payments)
+            
+            // Transform frontend data to receipt format
+            const receiptData: ReceiptData = {
+              id: frontendData.id,
+              billNo: frontendData.receiptNumber,
+              customerName: frontendData.clientName,
+              customerPhone: frontendData.clientPhone || 'N/A',
+              date: frontendData.date,
+              time: formatSaleTimeForDisplay({ date: frontendData.date, time: frontendData.time }),
+              items: frontendData.items.map((item: any) => ({
+                name: item.name,
+                type: item.type,
+                quantity: item.quantity,
+                price: item.price,
+                total: item.total,
+                discount: item.discount ?? 0,
+                discountType: item.discountType || 'percentage',
+                staffName: item.staffName || frontendData.staffName,
+                staffContributions: item.staffContributions,
+                hsnSacCode: item.hsnSacCode || '',
+                taxAmount: item.taxAmount,
+                priceExcludingGST: item.priceExcludingGST,
+                taxRate: item.taxRate,
+                lineSource: item.lineSource,
+              })),
+              netTotal: frontendData.subtotal,
+              taxAmount: frontendData.tax,
+              grossTotal: frontendData.total - (frontendData.tip || 0),
+              subtotalExcludingTax: frontendData.subtotalExcludingTax,
+              tip: frontendData.tip || 0,
+              tipStaffName: frontendData.tipStaffName,
+              tipLines: frontendData.tipLines,
+              paymentMode: frontendData.payments?.[0]?.type || 'Cash',
+              payments: buildReceiptPaymentsWithLegacyFallback({
+                  date: frontendData.date,
+                  payments: (frontendData.payments || []).map(
+                    (p: { type?: string; amount?: number }) => ({
+                      mode: p.type,
+                      amount: p.amount,
+                    })
+                  ),
+                  paymentHistory: frontendData.paymentHistory || [],
+                  loyaltyPointsRedeemed: frontendData.loyaltyPointsRedeemed,
+                  loyaltyDiscountAmount: frontendData.loyaltyDiscountAmount,
+                  status:
+                    typeof frontendData.status === "string"
+                      ? frontendData.status
+                      : frontendData.invoiceDeleted
+                        ? "cancelled"
+                        : undefined,
+                  invoiceDeleted: frontendData.invoiceDeleted,
+                  grossTotal: frontendData.total - (frontendData.tip || 0),
+                  paymentMode: frontendData.payments?.[0]?.type || "",
+                  tip: frontendData.tip || 0,
+                }),
+              staffName: frontendData.staffName,
+              status:
+                typeof frontendData.status === "string"
+                  ? frontendData.status
+                  : frontendData.invoiceDeleted
+                    ? "cancelled"
+                    : "completed",
+              invoiceDeleted: frontendData.invoiceDeleted === true,
+              // Include taxBreakdown for correct tax display
+              taxBreakdown: frontendData.taxBreakdown,
+              shareToken: frontendData.shareToken,
+              billChangeCreditedToWallet:
+                typeof frontendData.billChangeCreditedToWallet === "number" &&
+                frontendData.billChangeCreditedToWallet > 0.005
+                  ? frontendData.billChangeCreditedToWallet
+                  : undefined,
+              walletRefundCredited:
+                typeof frontendData.walletRefundCredited === "number" &&
+                frontendData.walletRefundCredited > 0.005
+                  ? frontendData.walletRefundCredited
+                  : undefined,
+              refundHistory: Array.isArray(frontendData.refundHistory)
+                ? frontendData.refundHistory
+                : undefined,
+              paymentStatus: frontendData.paymentStatus,
+            }
+            
+            console.log('🔍 Frontend receipt data:', receiptData)
+            console.log('🔍 Frontend taxBreakdown:', receiptData.taxBreakdown)
+            setReceipt(receiptData)
+            console.log('✅ Receipt loaded from frontend data with correct taxBreakdown')
+            return
+          }
+        } catch (frontendError) {
+          console.error('❌ Frontend data parsing failed:', frontendError)
+        }
+
+        // Fallback: Try to fetch sale data from the API using bill number
+        try {
+          const response = await SalesAPI.getByBillNo(billNo)
+          if (response.success && response.data) {
+            console.log('✅ Sale data found from API:', response.data)
+            
+            // Transform sale data to receipt format
+            const saleData = response.data
+            console.log('🔍 Raw sale data from API:', saleData)
+            console.log('🔍 Sale payments array:', saleData.payments)
+            console.log('🔍 Sale payment mode:', saleData.paymentMode)
+            
+            const receiptPaymentsFromSale = buildReceiptPaymentsWithLegacyFallback({
+              date: saleData.date,
+              payments: saleData.payments,
+              paymentHistory: saleData.paymentHistory || [],
+              loyaltyPointsRedeemed: saleData.loyaltyPointsRedeemed,
+              loyaltyDiscountAmount: saleData.loyaltyDiscountAmount,
+              status: saleData.status,
+              invoiceDeleted: saleData.invoiceDeleted,
+              paymentStatus: saleData.paymentStatus,
+              grossTotal: saleData.grossTotal,
+              paymentMode: saleData.paymentMode,
+              tip: saleData.tip,
+            })
+
+            const receiptData: ReceiptData = {
+              id: saleData._id || saleData.id,
+              billNo: saleData.billNo,
+              customerName: saleData.customerName,
+              customerPhone: saleData.customerPhone || 'N/A',
+              date: saleData.date,
+              time: formatSaleTimeForDisplay({ date: saleData.date, time: saleData.time }),
+              items: (saleData.items || []).map((item: any) => ({
+                name: item.name,
+                type: item.type,
+                quantity: item.quantity,
+                price: item.price,
+                total: item.total,
+                discount: item.discount ?? 0,
+                discountType: item.discountType || 'percentage',
+                staffName: item.staffName || saleData.staffName,
+                staffContributions: item.staffContributions,
+                hsnSacCode: item.hsnSacCode || '',
+                taxAmount: item.taxAmount,
+                priceExcludingGST: item.priceExcludingGST,
+                taxRate: item.taxRate,
+                lineSource: item.lineSource,
+              })),
+              netTotal: saleData.netTotal,
+              taxAmount: saleData.taxAmount,
+              grossTotal: saleData.grossTotal,
+              subtotalExcludingTax: (saleData.items || []).reduce((sum: number, item: any) => {
+                const base = item.priceExcludingGST != null ? item.priceExcludingGST * (item.quantity || 1) : (item.total || 0) - (item.taxAmount || 0)
+                return sum + base
+              }, 0) || (saleData.grossTotal - saleData.taxAmount),
+              tip: saleData.tip || 0,
+              tipStaffName: saleData.tipStaffName,
+              tipLines: Array.isArray(saleData.tipLines)
+                ? saleData.tipLines
+                    .map((tl: any) => ({
+                      staffName: tl.staffName != null ? String(tl.staffName).trim() : undefined,
+                      amount: Math.max(0, Number(tl.amount) || 0),
+                    }))
+                    .filter((tl: { amount: number }) => tl.amount > 0.005)
+                : undefined,
+              paymentMode: saleData.paymentMode,
+              payments: receiptPaymentsFromSale,
+              staffName: saleData.staffName,
+              status: typeof saleData.status === "string" ? saleData.status : saleData.invoiceDeleted ? "cancelled" : "completed",
+              invoiceDeleted: saleData.invoiceDeleted === true,
+              taxBreakdown: saleData.taxBreakdown ? {
+                serviceTax: saleData.taxBreakdown.serviceTax ?? 0,
+                serviceRate: saleData.taxBreakdown.serviceRate ?? 5,
+                productTaxByRate: saleData.taxBreakdown.productTaxByRate || {}
+              } : undefined,
+              shareToken: saleData.shareToken,
+              billChangeCreditedToWallet:
+                saleData.billChangeCreditedToWallet != null &&
+                Number(saleData.billChangeCreditedToWallet) > 0.005
+                  ? Number(saleData.billChangeCreditedToWallet)
+                  : undefined,
+              walletRefundCredited:
+                saleData.walletRefundCredited != null &&
+                Number(saleData.walletRefundCredited) > 0.005
+                  ? Number(saleData.walletRefundCredited)
+                  : undefined,
+              refundHistory: Array.isArray(saleData.refundHistory) ? saleData.refundHistory : undefined,
+              paymentStatus: saleData.paymentStatus,
+              discount: Math.max(0, Number(saleData.discount) || 0),
+              discountType: saleData.discountType,
+              loyaltyDiscountAmount: Math.max(0, Number(saleData.loyaltyDiscountAmount) || 0),
+              receiptTotalsBreakdown: saleData.receiptTotalsBreakdown ?? undefined,
+            }
+            
+            console.log('🔍 Final receipt data from API:', receiptData)
+            console.log('🔍 Payments array:', receiptData.payments)
+            setReceipt(receiptData)
+          } else {
+            console.log('❌ Sale not found for bill number:', billNo)
+            setError('Receipt not found')
+          }
+        } catch (apiError) {
+          console.error('❌ API error:', apiError)
+          setError('Failed to load receipt data')
+        }
+      } catch (err) {
+        console.error('Error loading receipt:', err)
+        setError('Failed to load receipt')
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    loadReceipt()
+  }, [params.billNo])
+
+  // Past deleted invoices: old ?data= URLs lacked status flags; resolve via API (archived bill) and show Cancelled
+  useEffect(() => {
+    if (!searchParams.get("data")) return
+    const billNo = params.billNo as string
+    if (!billNo || !receipt) return
+    if (receipt.invoiceDeleted || String(receipt.status).toLowerCase() === "cancelled") return
+
+    let unmounted = false
+    const id = setTimeout(() => {
+      SalesAPI.getByBillNo(billNo)
+        .then((res) => {
+          if (unmounted || !res?.success || !res.data) return
+          const d = res.data as { invoiceDeleted?: boolean; status?: string }
+          if (d.invoiceDeleted || String(d.status).toLowerCase() === "cancelled") {
+            setReceipt((prev) => (prev ? { ...prev, status: "cancelled", invoiceDeleted: true } : null))
+          }
+        })
+        .catch(() => {})
+    }, 0)
+    return () => {
+      unmounted = true
+      clearTimeout(id)
+    }
+  }, [receipt, params.billNo, searchParams])
+
+  // Resolve Mongo sale id when receipt was opened from ?data= (no id in payload)
+  useEffect(() => {
+    const billNo = params.billNo as string
+    if (!billNo || receipt?.id) return
+    const status = String(receipt?.status || "").toLowerCase()
+    if (!["completed", "partial", "unpaid"].includes(status) || receipt?.invoiceDeleted) return
+
+    let cancelled = false
+    SalesAPI.getByBillNo(billNo)
+      .then((res) => {
+        if (cancelled || !res?.success || !res.data) return
+        const saleId = res.data._id || res.data.id
+        if (!saleId) return
+        setReceipt((prev) => (prev ? { ...prev, id: String(saleId) } : prev))
+      })
+      .catch(() => {})
+
+    return () => {
+      cancelled = true
+    }
+  }, [params.billNo, receipt?.id, receipt?.status, receipt?.invoiceDeleted])
+
+  const showConsumptionCta = useMemo(
+    () =>
+      canShowRecordConsumptionCta({
+        saleId: receipt?.id,
+        status: receipt?.status,
+        invoiceDeleted: receipt?.invoiceDeleted,
+      }),
+    [receipt?.id, receipt?.status, receipt?.invoiceDeleted]
+  )
+
+  const handlePrint = () => {
+    if (!receipt) return
+    printReceiptWithTemplate(
+      receiptPreviewFromBillPageData({
+        ...receipt,
+        payments: receipt.payments.map((payment) => ({
+          mode: payment.type,
+          amount: payment.amount,
+          recordedAt: payment.recordedAt,
+        })),
+      }),
+      businessSettings
+    )
+  }
+
+  const handleShareWhatsApp = () => {
+    const phone = receipt?.customerPhone || (receipt as any)?.clientPhone || ''
+    const digitsOnly = phone.replace(/\D/g, '')
+    let waPhone = digitsOnly
+    if (digitsOnly.length === 10) {
+      waPhone = '91' + digitsOnly
+    } else if (digitsOnly.length === 11 && digitsOnly.startsWith('0')) {
+      waPhone = '91' + digitsOnly.slice(1)
+    } else if (digitsOnly.length >= 10) {
+      waPhone = digitsOnly.startsWith('91') ? digitsOnly : '91' + digitsOnly.slice(-10)
+    }
+    if (!waPhone || waPhone.length < 10) {
+      toast({
+        title: "No phone number",
+        description: "Customer phone number is not available for this receipt.",
+        variant: "destructive",
+      })
+      return
+    }
+    let baseUrl = typeof window !== 'undefined' ? window.location.origin : ''
+    if (baseUrl.startsWith('https://localhost') || baseUrl.startsWith('https://127.0.0.1')) {
+      baseUrl = baseUrl.replace('https://', 'http://')
+    }
+    const publicUrl = receipt?.shareToken
+      ? `${baseUrl}/receipt/public/${receipt.billNo}/${receipt.shareToken}`
+      : (typeof window !== 'undefined' ? window.location.href : '')
+    const clientName = receipt?.customerName || (receipt as any)?.clientName || 'Customer'
+    const totalAmount = receipt?.grossTotal ?? receipt?.netTotal ?? 0
+    const message = `Hi ${clientName},
+
+Your invoice ${receipt?.billNo || ''} is ready.
+Total: ₹${totalAmount}
+
+View here:
+${publicUrl}`
+    const whatsappUrl = `https://wa.me/${waPhone}?text=${encodeURIComponent(message)}`
+    window.open(whatsappUrl, '_blank', 'noopener,noreferrer')
+  }
+
+  const pageContent = isLoading ? (
+    <div className="min-h-screen bg-background flex items-center justify-center">
+      <div className="text-center">
+        <div className="w-8 h-8 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+        <p className="text-gray-600">Loading receipt...</p>
+      </div>
+    </div>
+  ) : error || !receipt ? (
+    <div className="min-h-screen bg-background flex items-center justify-center">
+      <div className="text-center">
+        <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+          <span className="text-2xl">❌</span>
+        </div>
+        <h1 className="text-xl font-semibold text-gray-900 mb-2">Receipt Not Found</h1>
+        <p className="text-gray-600 mb-6">{error || 'The requested receipt could not be found.'}</p>
+        <Link href="/reports" prefetch={false}>
+          <Button variant="outline" className="mr-2">
+            <ArrowLeft className="h-4 w-4 mr-2" />
+            Back to Reports
+          </Button>
+        </Link>
+      </div>
+    </div>
+  ) : (
+    <div className="min-h-screen bg-background p-6">
+      {/* Header with Actions */}
+      <div className="max-w-4xl mx-auto mb-6 no-print">
+        <div className="flex items-center justify-between bg-white rounded-lg shadow-sm p-4">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900">Receipt #{receipt.billNo}</h1>
+            <p className="text-gray-600">
+              {receipt.customerName} • {new Date(receipt.date).toLocaleDateString()} • {receipt.time}
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            <Link
+              href={(() => {
+                const raw = searchParams.get("returnTo")
+                if (!raw) return "/quick-sale"
+                try {
+                  const decoded = decodeURIComponent(raw)
+                  if (decoded.startsWith("/")) return decoded
+                } catch {
+                  /* ignore */
+                }
+                return raw.startsWith("/") ? raw : `/${raw}`
+              })()}
+            >
+              <Button variant="outline">
+                <ArrowLeft className="h-4 w-4 mr-2" />
+                Back
+              </Button>
+            </Link>
+            <Button onClick={handlePrint} variant="outline">
+              <Printer className="h-4 w-4 mr-2" />
+              Print
+            </Button>
+            {showConsumptionCta && receipt.id ? (
+              <Button
+                onClick={() => setConsumptionDialogOpen(true)}
+                variant="outline"
+                className="bg-amber-50 border-amber-200 text-amber-900 hover:bg-amber-100"
+              >
+                <Package className="h-4 w-4 mr-2" />
+                Record consumption
+              </Button>
+            ) : null}
+            <Button onClick={handleShareWhatsApp} variant="outline" className="bg-green-50 border-green-200 text-green-700 hover:bg-green-100">
+              <MessageCircle className="h-4 w-4 mr-2" />
+              Share via WhatsApp
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {/* Receipt Content */}
+      <div className="max-w-4xl mx-auto">
+        <div className="bg-white rounded-lg shadow-sm overflow-hidden overflow-x-hidden flex justify-center">
+          <ReceiptTemplateView
+            receipt={receiptPreviewFromBillPageData({
+              ...receipt,
+              payments: receipt.payments.map((payment) => ({
+                mode: payment.type,
+                amount: payment.amount,
+                recordedAt: payment.recordedAt,
+              })),
+            })}
+            businessSettings={businessSettings}
+          />
+        </div>
+      </div>
+
+      <ReceiptPrintStyles businessSettings={businessSettings} />
+
+      {receipt?.id ? (
+        <RecordConsumptionDialog
+          saleId={String(receipt.id)}
+          billNo={receipt.billNo}
+          open={consumptionDialogOpen}
+          onOpenChange={setConsumptionDialogOpen}
+        />
+      ) : null}
+    </div>
+  )
+
+  return (
+    <ProtectedRoute requiredModule="sales">
+      <ProtectedLayout requiredModule="sales">
+        {pageContent}
+      </ProtectedLayout>
+    </ProtectedRoute>
+  )
+}

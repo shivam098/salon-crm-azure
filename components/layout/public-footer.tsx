@@ -1,0 +1,128 @@
+import Link from "next/link"
+import { Mail, MapPin, Linkedin, Instagram } from "lucide-react"
+
+
+const footerLinks = [
+  {
+    title: "Product",
+    links: [
+      { label: "Features", href: "/features" },
+      { label: "Solutions", href: "/solutions" },
+      { label: "Pricing", href: "/pricing" },
+      { label: "FAQ", href: "/faq" },
+      { label: "Blog", href: "/blog" },
+    ],
+  },
+  {
+    title: "Company",
+    links: [
+      { label: "Why EaseMySalon", href: "/about" },
+      { label: "Partners", href: "/solutions" },
+      { label: "Careers (coming soon)", href: "#" },
+      { label: "Contact", href: "/contact" },
+    ],
+  },
+]
+
+export function PublicFooter() {
+  return (
+    <footer className="mt-24 bg-slate-950 text-slate-200">
+      <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-16">
+        <div className="grid gap-10 lg:grid-cols-4">
+          <div className="space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="h-10 w-10 rounded-2xl bg-gradient-to-br from-[#7C3AED] via-[#8B5CF6] to-[#A855F7] text-white font-bold text-xl flex items-center justify-center">
+                E
+              </div>
+              <div>
+                <p className="font-semibold text-white">EaseMySalon</p>
+                <p className="text-xs text-slate-400">Salon OS for India</p>
+              </div>
+            </div>
+            <p className="text-sm text-slate-400 leading-relaxed">From POS to payroll, EaseMySalon powers every workflow so you can focus on exceptional client experiences. Trusted by 350+ salons across India.</p>
+            
+            {/* Trust Badges */}
+            <div className="pt-4 space-y-3">
+              <div className="flex items-center gap-2 text-sm text-slate-300">
+                <div className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span>98% Customer Satisfaction</span>
+              </div>
+              <div className="flex items-center gap-2 text-sm text-slate-300">
+                <div className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span>Setup in 1 Day</span>
+              </div>
+            </div>
+            
+          </div>
+          {footerLinks.map((section) => (
+            <div key={section.title}>
+              <p className="text-sm font-semibold tracking-wide text-white uppercase">{section.title}</p>
+              <ul className="mt-4 space-y-2 text-sm text-slate-400">
+                {section.links.map((link) => (
+                  <li key={link.label}>
+                    <Link href={link.href} className="hover:text-white transition">
+                      {link.label}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+          <div>
+            <p className="text-sm font-semibold tracking-wide text-white uppercase">Contact</p>
+            <ul className="mt-4 space-y-3 text-sm text-slate-400">
+              <li className="flex items-start gap-3">
+                <Mail className="h-4 w-4 mt-1 text-white" />
+                <a href="mailto:support@easemysalon.in" className="hover:text-white transition">
+                  support@easemysalon.in
+                </a>
+              </li>
+              <li className="flex items-start gap-3">
+                <MapPin className="h-4 w-4 mt-1 text-white" />
+                <p>Operating across India. Crafted with love in Bengaluru.</p>
+              </li>
+            </ul>
+            <div className="flex gap-3 text-slate-400 pt-4">
+              {[
+                { Icon: Linkedin, href: "https://www.linkedin.com/company/easemysalon/", label: "LinkedIn" },
+                { Icon: Instagram, href: "https://www.instagram.com/easemysalon_official/", label: "Instagram" },
+              ].map(({ Icon, href, label }) => (
+                <a
+                  key={label}
+                  href={href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={label}
+                  className="h-10 w-10 rounded-full border border-white/10 flex items-center justify-center hover:bg-white/10 hover:border-white/20 transition-all transform hover:scale-110"
+                >
+                  <Icon className="h-4 w-4" />
+                </a>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="mt-12 border-t border-white/10 pt-6 flex flex-col md:flex-row gap-4 justify-between text-xs text-slate-500">
+          <p>© {new Date().getFullYear()} EaseMySalon. All rights reserved.</p>
+          <div className="flex gap-6 flex-wrap">
+            <Link href="/terms-and-conditions" className="hover:text-white transition">
+              Terms & Conditions
+            </Link>
+            <Link href="/refund-policy" className="hover:text-white transition">
+              Refund Policy
+            </Link>
+            <Link href="/privacy-policy" className="hover:text-white transition">
+              Privacy
+            </Link>
+            <Link href="/faq" className="hover:text-white transition">
+              Support
+            </Link>
+            <Link href="/contact" className="hover:text-white transition">
+              Contact
+            </Link>
+          </div>
+        </div>
+      </div>
+    </footer>
+  )
+}
+

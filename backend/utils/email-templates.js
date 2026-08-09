@@ -1,0 +1,1144 @@
+/**
+ * Email Templates
+ * Generates HTML and plain text email templates
+ */
+
+const { renderDailySummaryEmail } = require('../lib/daily-summary-email');
+
+/** @deprecated Use renderDailySummaryEmail via daily-summary-dispatch — kept for compatibility */
+function dailySummary(params) {
+  return renderDailySummaryEmail(
+    {
+      branchName: params.businessName,
+      date: params.date,
+      dateFormatted: params.dateFormatted,
+      todayBills: params.totalBillCount ?? params.todayBills ?? 0,
+      todayAppointments: params.todayAppointments ?? 0,
+      todayCancelledBills: params.todayCancelledBills ?? 0,
+      todayNetRevenue: params.todayNetRevenue ?? params.totalSales ?? 0,
+      todayGrossRevenue: params.todayGrossRevenue ?? params.totalSales ?? 0,
+      revenueByCategory: params.revenueByCategory ?? {
+        services: 0,
+        products: 0,
+        packages: 0,
+        membership: 0,
+        prepaid: 0,
+      },
+      paymentMode: params.paymentMode ?? {
+        cash: params.totalSalesCash ?? 0,
+        online: params.totalSalesOnline ?? 0,
+        card: params.totalSalesCard ?? 0,
+      },
+      averageBillValue: params.averageBillValue ?? 0,
+      duesCollected: params.duesCollected ?? 0,
+      cashExpense: params.cashExpense ?? 0,
+      tipCollected: params.tipCollected ?? 0,
+      cashBalance: params.cashBalance ?? 0,
+      feedbackReceived: params.feedbackReceived ?? 0,
+      consentFormReceived: params.consentFormReceived ?? 0,
+      yesterdayNetRevenue: params.yesterdayNetRevenue ?? 0,
+      last7DayAvgRevenue: params.last7DayAvgRevenue ?? 0,
+      monthToDateRevenue: params.monthToDateRevenue ?? 0,
+      monthToDateBills: params.monthToDateBills ?? 0,
+    },
+    params.charts || {},
+    {
+      ownerName: params.ownerName,
+      logoUrl: params.logoUrl,
+      dashboardUrl: params.dashboardUrl,
+      settingsUrl: params.settingsUrl,
+    }
+  );
+}
+
+function weeklySummary(params) {
+  const { renderWeeklySummaryEmail } = require('../lib/weekly-summary-email');
+  const { buildWeeklySummaryChartUrls } = require('../lib/weekly-summary-charts');
+  const data = {
+    branchName: params.businessName,
+    weekStartDate: params.weekStartDate || params.weekStart,
+    weekEndDate: params.weekEndDate || params.weekEnd,
+    weekRangeFormatted: params.weekRangeFormatted,
+    weekTotalRevenue: params.weekTotalRevenue ?? params.totalRevenue,
+    weekTotalBills: params.weekTotalBills ?? params.totalSales,
+    weekTotalAppointments: params.weekTotalAppointments ?? params.appointmentCount,
+    previousWeekTotalRevenue: params.previousWeekTotalRevenue,
+    dailyRevenue: params.dailyRevenue,
+    bestDay: params.bestDay,
+    slowestDay: params.slowestDay,
+    topServices: params.topServices,
+    newCustomers: params.newCustomers ?? params.newClients,
+    returningCustomers: params.returningCustomers,
+    appointmentFunnel: params.appointmentFunnel,
+    staffLeaderboard: params.staffLeaderboard,
+    weeklyRevenueGoal: params.weeklyRevenueGoal,
+    weeksSinceBest: params.weeksSinceBest,
+  };
+  const charts = buildWeeklySummaryChartUrls(data);
+  return renderWeeklySummaryEmail(data, charts, {
+    ownerName: params.ownerName,
+    logoUrl: params.logoUrl,
+    dashboardUrl: params.dashboardUrl,
+  });
+}
+
+function receipt({ clientName, receiptNumber, businessName, date, items, subtotal, tax, discount, total, paymentMethod, receiptLink }) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #667eea; color: white; padding: 30px 20px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f9f9f9; padding: 40px 30px; border-radius: 0 0 10px 10px; text-align: center; }
+        .footer { text-align: center; margin-top: 30px; color: #999; font-size: 12px; }
+        .button { display: inline-block; background: #667eea; color: white; padding: 18px 40px; text-decoration: none; border-radius: 5px; font-weight: bold; font-size: 18px; margin: 30px 0; }
+        .button:hover { background: #5568d3; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1 style="margin: 0; font-size: 24px;">🧾 Receipt ${receiptNumber}</h1>
+        </div>
+        <div class="content">
+          <p style="font-size: 16px; margin-bottom: 20px;">Dear ${clientName},</p>
+          <p style="font-size: 16px; margin-bottom: 30px;">Thank you for your visit!</p>
+          
+          ${receiptLink ? `
+          <div style="margin: 40px 0;">
+            <a href="${receiptLink}" class="button">View Your Invoice Here</a>
+          </div>
+          ` : `
+          <p style="color: #666; font-size: 14px;">
+            Please contact us if you need a copy of your receipt.
+          </p>
+          `}
+          
+          <div class="footer">
+            <p>Thank you for choosing ${businessName}!</p>
+            <p>This is an automated email from EaseMySalon CRM</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `
+Receipt ${receiptNumber}
+
+Dear ${clientName},
+
+Thank you for your visit!
+
+${receiptLink ? `View your invoice here: ${receiptLink}` : 'Please contact us if you need a copy of your receipt.'}
+
+Thank you for choosing ${businessName}!
+  `;
+
+  return { html, text };
+}
+
+function appointmentConfirmation({ clientName, serviceName, date, time, staffName, businessName, businessPhone, notes }) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #10b981; color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+        .info-box { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; }
+        .footer { text-align: center; margin-top: 30px; color: #999; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>✅ Appointment Confirmed</h1>
+        </div>
+        <div class="content">
+          <p>Dear ${clientName},</p>
+          <p>Your appointment has been confirmed!</p>
+          
+          <div class="info-box">
+            <h3>Appointment Details:</h3>
+            <p><strong>Service:</strong> ${serviceName}</p>
+            <p><strong>Date:</strong> ${date}</p>
+            <p><strong>Time:</strong> ${time}</p>
+            ${staffName ? `<p><strong>Staff:</strong> ${staffName}</p>` : ''}
+            ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ''}
+          </div>
+          
+          <div class="info-box">
+            <p><strong>Business:</strong> ${businessName}</p>
+            ${businessPhone ? `<p><strong>Phone:</strong> ${businessPhone}</p>` : ''}
+          </div>
+          
+          <p>We look forward to seeing you!</p>
+          
+          <div class="footer">
+            <p>This is an automated email from EaseMySalon CRM</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `
+Appointment Confirmed
+
+Dear ${clientName},
+
+Your appointment has been confirmed!
+
+Appointment Details:
+Service: ${serviceName}
+Date: ${date}
+Time: ${time}
+${staffName ? `Staff: ${staffName}\n` : ''}
+${notes ? `Notes: ${notes}\n` : ''}
+
+Business: ${businessName}
+${businessPhone ? `Phone: ${businessPhone}\n` : ''}
+
+We look forward to seeing you!
+  `;
+
+  return { html, text };
+}
+
+function appointmentReminder({ clientName, serviceName, date, time, staffName, businessName, businessPhone }) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #f59e0b; color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+        .info-box { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; }
+        .footer { text-align: center; margin-top: 30px; color: #999; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>⏰ Appointment Reminder</h1>
+        </div>
+        <div class="content">
+          <p>Dear ${clientName},</p>
+          <p>This is a reminder about your upcoming appointment:</p>
+          
+          <div class="info-box">
+            <h3>Appointment Details:</h3>
+            <p><strong>Service:</strong> ${serviceName}</p>
+            <p><strong>Date:</strong> ${date}</p>
+            <p><strong>Time:</strong> ${time}</p>
+            ${staffName ? `<p><strong>Staff:</strong> ${staffName}</p>` : ''}
+          </div>
+          
+          <div class="info-box">
+            <p><strong>Business:</strong> ${businessName}</p>
+            ${businessPhone ? `<p><strong>Phone:</strong> ${businessPhone}</p>` : ''}
+          </div>
+          
+          <p>We look forward to seeing you!</p>
+          
+          <div class="footer">
+            <p>This is an automated email from EaseMySalon CRM</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `
+Appointment Reminder
+
+Dear ${clientName},
+
+This is a reminder about your upcoming appointment:
+
+Service: ${serviceName}
+Date: ${date}
+Time: ${time}
+${staffName ? `Staff: ${staffName}\n` : ''}
+
+Business: ${businessName}
+${businessPhone ? `Phone: ${businessPhone}\n` : ''}
+
+We look forward to seeing you!
+  `;
+
+  return { html, text };
+}
+
+function appointmentCancellation({ clientName, serviceName, date, time, businessName, businessPhone }) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #ef4444; color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+        .info-box { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; }
+        .footer { text-align: center; margin-top: 30px; color: #999; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>❌ Appointment Cancelled</h1>
+        </div>
+        <div class="content">
+          <p>Dear ${clientName},</p>
+          <p>Your appointment has been cancelled:</p>
+          
+          <div class="info-box">
+            <h3>Cancelled Appointment:</h3>
+            <p><strong>Service:</strong> ${serviceName}</p>
+            <p><strong>Date:</strong> ${date}</p>
+            <p><strong>Time:</strong> ${time}</p>
+          </div>
+          
+          <p>If you would like to reschedule, please contact us.</p>
+          
+          <div class="info-box">
+            <p><strong>Business:</strong> ${businessName}</p>
+            ${businessPhone ? `<p><strong>Phone:</strong> ${businessPhone}</p>` : ''}
+          </div>
+          
+          <div class="footer">
+            <p>This is an automated email from EaseMySalon CRM</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `
+Appointment Cancelled
+
+Dear ${clientName},
+
+Your appointment has been cancelled:
+
+Service: ${serviceName}
+Date: ${date}
+Time: ${time}
+
+If you would like to reschedule, please contact us.
+
+Business: ${businessName}
+${businessPhone ? `Phone: ${businessPhone}\n` : ''}
+  `;
+
+  return { html, text };
+}
+
+function exportReady({ exportType, downloadUrl, businessName, hasAttachment = false }) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #667eea; color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+        .button { display: inline-block; background: #667eea; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+        .footer { text-align: center; margin-top: 30px; color: #999; font-size: 12px; }
+        .attachment-notice { background: #e0e7ff; border-left: 4px solid #667eea; padding: 15px; margin: 20px 0; border-radius: 5px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>📥 Export Ready</h1>
+        </div>
+        <div class="content">
+          <p>Hello,</p>
+          ${hasAttachment ? `
+          <p>Your ${exportType} export has been generated and is attached to this email.</p>
+          <div class="attachment-notice">
+            <p><strong>📎 File Attached:</strong> Please check the attachment below to download your export file.</p>
+          </div>
+          ` : `
+          <p>Your ${exportType} export is ready for download.</p>
+          <div style="text-align: center;">
+            <a href="${downloadUrl}" class="button">Download ${exportType}</a>
+          </div>
+          <p><strong>Note:</strong> This link will expire in 7 days.</p>
+          `}
+          
+          <div class="footer">
+            <p>This is an automated email from ${businessName || 'EaseMySalon CRM'}</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `
+Export Ready
+
+Hello,
+
+${hasAttachment ? 
+  `Your ${exportType} export has been generated and is attached to this email. Please check the attachment to download your export file.` :
+  `Your ${exportType} export is ready for download.
+
+Download Link: ${downloadUrl}
+
+Note: This link will expire in 7 days.`
+}
+
+This is an automated email from ${businessName || 'EaseMySalon CRM'}
+  `;
+
+  return { html, text };
+}
+
+function systemAlert({ alertType, message, businessName }) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #ef4444; color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+        .alert-box { background: #fee2e2; border-left: 4px solid #ef4444; padding: 15px; margin: 15px 0; }
+        .footer { text-align: center; margin-top: 30px; color: #999; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>⚠️ System Alert</h1>
+        </div>
+        <div class="content">
+          <p>Hello ${businessName},</p>
+          
+          <div class="alert-box">
+            <h3>Alert Type: ${alertType}</h3>
+            <p>${message}</p>
+          </div>
+          
+          <p>Please check your admin panel for more details.</p>
+          
+          <div class="footer">
+            <p>This is an automated email from EaseMySalon CRM</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `
+System Alert
+
+Hello ${businessName},
+
+Alert Type: ${alertType}
+Message: ${message}
+
+Please check your admin panel for more details.
+  `;
+
+  return { html, text };
+}
+
+function lowInventory({ products, businessName }) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #f59e0b; color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+        .product-item { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #f59e0b; }
+        .footer { text-align: center; margin-top: 30px; color: #999; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>📦 Low Inventory Alert</h1>
+        </div>
+        <div class="content">
+          <p>Hello ${businessName},</p>
+          <p>The following products are running low on stock:</p>
+          
+          ${products.map(product => `
+            <div class="product-item">
+              <strong>${product.name}</strong><br>
+              Current Stock: ${product.stock} ${product.unit || 'units'}<br>
+              ${product.minStock ? `Minimum Required: ${product.minStock} ${product.unit || 'units'}` : ''}
+            </div>
+          `).join('')}
+          
+          <p>Please consider restocking these items soon.</p>
+          
+          <div class="footer">
+            <p>This is an automated email from EaseMySalon CRM</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `
+Low Inventory Alert
+
+Hello ${businessName},
+
+The following products are running low on stock:
+
+${products.map(p => `- ${p.name}: ${p.stock} ${p.unit || 'units'} remaining${p.minStock ? ` (min: ${p.minStock})` : ''}`).join('\n')}
+
+Please consider restocking these items soon.
+  `;
+
+  return { html, text };
+}
+
+function appointmentNotification({ appointmentCount, businessName, date, time, clientName, serviceName }) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+        .success-box { background: #d1fae5; border-left: 4px solid #10b981; padding: 20px; margin: 20px 0; border-radius: 5px; }
+        .appointment-details { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .detail-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e5e7eb; }
+        .detail-row:last-child { border-bottom: none; }
+        .detail-label { font-weight: 600; color: #6b7280; }
+        .detail-value { color: #111827; }
+        .footer { text-align: center; margin-top: 30px; color: #999; font-size: 12px; }
+        .emoji { font-size: 32px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <div class="emoji">🎉</div>
+          <h1>Woah, New Appointment Created!</h1>
+        </div>
+        <div class="content">
+          <p>Hello ${businessName},</p>
+          
+          <div class="success-box">
+            <h2 style="margin: 0 0 10px 0; color: #065f46;">${appointmentCount} new appointment${appointmentCount > 1 ? 's' : ''} ${appointmentCount > 1 ? 'have' : 'has'} been created!</h2>
+            <p style="margin: 0; color: #047857;">Great news! Your business is growing! 🌟</p>
+          </div>
+          
+          ${clientName && serviceName ? `
+          <div class="appointment-details">
+            <h3 style="margin-top: 0; color: #111827;">Appointment Details:</h3>
+            ${clientName ? `<div class="detail-row"><span class="detail-label">Client:</span><span class="detail-value">${clientName}</span></div>` : ''}
+            ${serviceName ? `<div class="detail-row"><span class="detail-label">Service:</span><span class="detail-value">${serviceName}</span></div>` : ''}
+            ${date ? `<div class="detail-row"><span class="detail-label">Date:</span><span class="detail-value">${date}</span></div>` : ''}
+            ${time ? `<div class="detail-row"><span class="detail-label">Time:</span><span class="detail-value">${time}</span></div>` : ''}
+          </div>
+          ` : ''}
+          
+          <p>Please check your admin panel for more details.</p>
+          
+          <div class="footer">
+            <p>This is an automated email from EaseMySalon CRM</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `
+Woah, New Appointment Created!
+
+Hello ${businessName},
+
+${appointmentCount} new appointment${appointmentCount > 1 ? 's' : ''} ${appointmentCount > 1 ? 'have' : 'has'} been created!
+
+${clientName && serviceName ? `
+Appointment Details:
+${clientName ? `Client: ${clientName}` : ''}
+${serviceName ? `Service: ${serviceName}` : ''}
+${date ? `Date: ${date}` : ''}
+${time ? `Time: ${time}` : ''}
+` : ''}
+
+Please check your admin panel for more details.
+
+This is an automated email from EaseMySalon CRM
+  `;
+
+  return { html, text };
+}
+
+function appointmentCancellationNotification({ appointmentCount, businessName, appointmentDetails }) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+        .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+        .warning-box { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 20px; margin: 20px 0; border-radius: 5px; }
+        .appointment-details { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .detail-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e5e7eb; }
+        .detail-row:last-child { border-bottom: none; }
+        .detail-label { font-weight: 600; color: #6b7280; }
+        .detail-value { color: #111827; }
+        .footer { text-align: center; margin-top: 30px; color: #999; font-size: 12px; }
+        .emoji { font-size: 32px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <div class="emoji">⚠️</div>
+          <h1>Appointment Cancelled</h1>
+        </div>
+        <div class="content">
+          <p>Hello ${businessName},</p>
+          
+          <div class="warning-box">
+            <h2 style="margin: 0 0 10px 0; color: #92400e;">${appointmentCount} appointment${appointmentCount > 1 ? 's' : ''} ${appointmentCount > 1 ? 'have' : 'has'} been cancelled</h2>
+            <p style="margin: 0; color: #78350f;">Please check the details below.</p>
+          </div>
+          
+          ${appointmentDetails?.clientName && appointmentDetails?.serviceName ? `
+          <div class="appointment-details">
+            <h3 style="margin-top: 0; color: #111827;">Cancelled Appointment Details:</h3>
+            ${appointmentDetails.clientName ? `<div class="detail-row"><span class="detail-label">Client:</span><span class="detail-value">${appointmentDetails.clientName}</span></div>` : ''}
+            ${appointmentDetails.serviceName ? `<div class="detail-row"><span class="detail-label">Service:</span><span class="detail-value">${appointmentDetails.serviceName}</span></div>` : ''}
+            ${appointmentDetails.date ? `<div class="detail-row"><span class="detail-label">Date:</span><span class="detail-value">${appointmentDetails.date}</span></div>` : ''}
+            ${appointmentDetails.time ? `<div class="detail-row"><span class="detail-label">Time:</span><span class="detail-value">${appointmentDetails.time}</span></div>` : ''}
+          </div>
+          ` : ''}
+          
+          <p>Please check your admin panel for more details.</p>
+          
+          <div class="footer">
+            <p>This is an automated email from EaseMySalon CRM</p>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = `
+Appointment Cancelled
+
+Hello ${businessName},
+
+${appointmentCount} appointment${appointmentCount > 1 ? 's' : ''} ${appointmentCount > 1 ? 'have' : 'has'} been cancelled.
+
+${appointmentDetails?.clientName && appointmentDetails?.serviceName ? `
+Cancelled Appointment Details:
+${appointmentDetails.clientName ? `Client: ${appointmentDetails.clientName}` : ''}
+${appointmentDetails.serviceName ? `Service: ${appointmentDetails.serviceName}` : ''}
+${appointmentDetails.date ? `Date: ${appointmentDetails.date}` : ''}
+${appointmentDetails.time ? `Time: ${appointmentDetails.time}` : ''}
+` : ''}
+
+Please check your admin panel for more details.
+
+This is an automated email from EaseMySalon CRM
+  `;
+
+  return { html, text };
+}
+
+function staffIncentiveSummary({
+  businessName,
+  periodLabel,
+  periodStart,
+  periodEnd,
+  logoUrl,
+  rows = [],
+  totals = {},
+}) {
+  const fmt = (n) =>
+    n != null && Number.isFinite(Number(n))
+      ? Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      : '0.00';
+  const fmtInt = (n) => (n != null && Number.isFinite(Number(n)) ? String(Math.round(Number(n))) : '0');
+
+  const tableRows = (rows || [])
+    .map(
+      (row) => `
+          <tr>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0;">${row.staffName || '—'}</td>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0; text-align: right;">₹${fmt(row.totalRevenue)}</td>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0; text-align: right;">₹${fmt(row.serviceCommission)}</td>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0; text-align: right;">₹${fmt(row.productCommission)}</td>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0; text-align: right; font-weight: 700;">₹${fmt(row.totalCommission)}</td>
+          </tr>`
+    )
+    .join('');
+
+  const emptyRow =
+    rows && rows.length > 0
+      ? ''
+      : `<tr><td colspan="5" style="padding: 16px; text-align: center; color: #64748b;">No incentive data for this period.</td></tr>`;
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; }
+        .container { max-width: 720px; margin: 0 auto; padding: 24px; }
+        .logo { max-height: 48px; max-width: 180px; display: block; margin-bottom: 16px; }
+        .branch-name { font-size: 18px; font-weight: 600; color: #1e293b; margin-bottom: 8px; }
+        .report-title { font-size: 20px; font-weight: 700; color: #334155; margin-bottom: 8px; }
+        .period { color: #64748b; margin-bottom: 20px; }
+        .summary { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+        .pill { background: #f1f5f9; border-radius: 8px; padding: 12px 16px; min-width: 140px; }
+        .pill-label { font-size: 12px; color: #64748b; }
+        .pill-value { font-size: 18px; font-weight: 700; color: #0f172a; }
+        table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; }
+        th { background: #f8fafc; text-align: left; padding: 10px 8px; font-size: 12px; color: #475569; border-bottom: 2px solid #e2e8f0; }
+        th.num { text-align: right; }
+        .footer { text-align: center; margin-top: 24px; color: #94a3b8; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        ${logoUrl ? `<img src="${logoUrl}" alt="EaseMySalon" class="logo" />` : ''}
+        <div class="branch-name">${businessName || 'Branch'}</div>
+        <div class="report-title">Staff Incentive Summary</div>
+        <div class="period">${periodLabel || ''}${periodStart && periodEnd ? ` (${periodStart} to ${periodEnd})` : ''}</div>
+        <div class="summary">
+          <div class="pill"><div class="pill-label">Staff with incentive</div><div class="pill-value">${fmtInt(totals.staffCount)}</div></div>
+          <div class="pill"><div class="pill-label">Total attributed revenue</div><div class="pill-value">₹${fmt(totals.totalRevenue)}</div></div>
+          <div class="pill"><div class="pill-label">Total incentive</div><div class="pill-value">₹${fmt(totals.totalCommission)}</div></div>
+          <div class="pill"><div class="pill-label">Bills in period</div><div class="pill-value">${fmtInt(totals.billCount)}</div></div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Staff</th>
+              <th class="num">Revenue</th>
+              <th class="num">Service incentive</th>
+              <th class="num">Product incentive</th>
+              <th class="num">Total incentive</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tableRows}${emptyRow}
+          </tbody>
+        </table>
+        <div class="footer">
+          <p>This is an automated email from EaseMySalon</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const textLines = [
+    `${businessName || 'Branch'}`,
+    `Staff Incentive Summary — ${periodLabel || ''}`,
+    periodStart && periodEnd ? `Period: ${periodStart} to ${periodEnd}` : '',
+    '',
+    `Staff with incentive: ${fmtInt(totals.staffCount)}`,
+    `Total attributed revenue: ₹${fmt(totals.totalRevenue)}`,
+    `Total incentive: ₹${fmt(totals.totalCommission)}`,
+    `Bills in period: ${fmtInt(totals.billCount)}`,
+    '',
+  ];
+
+  for (const row of rows || []) {
+    textLines.push(
+      `${row.staffName || 'Staff'} — Revenue ₹${fmt(row.totalRevenue)}, Service ₹${fmt(row.serviceCommission)}, Product ₹${fmt(row.productCommission)}, Total ₹${fmt(row.totalCommission)}`
+    );
+  }
+
+  if (!rows || rows.length === 0) {
+    textLines.push('No incentive data for this period.');
+  }
+
+  textLines.push('', 'This is an automated email from EaseMySalon');
+
+  return { html, text: textLines.filter(Boolean).join('\n') };
+}
+
+function staffTimesheetReport({
+  businessName,
+  staffName,
+  periodLabel,
+  daysWithCheckIn,
+  totalHours,
+  rowCount,
+  logoUrl,
+}) {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #334155; margin: 0; }
+        .container { max-width: 600px; margin: 0 auto; padding: 24px; }
+        .logo { max-height: 48px; max-width: 180px; display: block; margin-bottom: 16px; }
+        .branch-name { font-size: 18px; font-weight: 600; color: #1e293b; margin-bottom: 4px; }
+        .title { font-size: 20px; font-weight: 700; color: #334155; margin: 16px 0 4px; }
+        .period { color: #64748b; margin-bottom: 20px; }
+        .greeting { font-size: 16px; font-weight: 600; color: #0f172a; margin-bottom: 12px; }
+        .stats { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin: 16px 0; }
+        .stat-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 14px; }
+        .stat-label { color: #64748b; }
+        .stat-value { font-weight: 600; color: #0f172a; }
+        .attachment { background: #eff6ff; border-left: 4px solid #3b82f6; padding: 14px 16px; margin-top: 20px; border-radius: 6px; color: #1e40af; }
+        .footer { text-align: center; margin-top: 24px; color: #94a3b8; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        ${logoUrl ? `<img src="${logoUrl}" alt="Logo" class="logo" />` : ''}
+        <div class="branch-name">${businessName || 'EaseMySalon'}</div>
+        <div class="title">Timesheet Report</div>
+        <div class="period">${periodLabel || ''}</div>
+        <div class="greeting">Hi ${staffName || 'there'},</div>
+        <p>Your timesheet for the period above is attached to this email.</p>
+        <div class="stats">
+          <div class="stat-row"><span class="stat-label">Days in period</span><span class="stat-value">${rowCount || 0}</span></div>
+          <div class="stat-row"><span class="stat-label">Days with check-in</span><span class="stat-value">${daysWithCheckIn || 0}</span></div>
+          <div class="stat-row"><span class="stat-label">Total logged time</span><span class="stat-value">${totalHours || '0m'}</span></div>
+        </div>
+        <div class="attachment">
+          <strong>Timesheets attached (Excel + PDF)</strong> — Includes scheduled hours, check-in/out, duration, status, and block times for each day.
+        </div>
+        <div class="footer">
+          <p>This is an automated email from EaseMySalon</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = [
+    businessName || 'EaseMySalon',
+    `Timesheet Report — ${periodLabel || ''}`,
+    '',
+    `Hi ${staffName || 'there'},`,
+    '',
+    'Your timesheet for the period above is attached to this email.',
+    '',
+    `Days in period: ${rowCount || 0}`,
+    `Days with check-in: ${daysWithCheckIn || 0}`,
+    `Total logged time: ${totalHours || '0m'}`,
+    '',
+    `Timesheet attached (Excel + PDF).`,
+    '',
+    'This is an automated email from EaseMySalon',
+  ].join('\n');
+
+  return { html, text };
+}
+
+function staffPayrollSummary({
+  businessName,
+  periodLabel,
+  logoUrl,
+  rows = [],
+  totals = {},
+  attachmentCount = 0,
+}) {
+  const tableRows = (rows || [])
+    .map(
+      (row) => `
+          <tr>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0;">
+              <strong>${row.staffName || '—'}</strong>
+              ${row.role ? `<br><span style="font-size: 12px; color: #64748b;">${row.role}</span>` : ''}
+            </td>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0; text-align: right; white-space: nowrap;">${row.baseSalary}</td>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0; text-align: right; white-space: nowrap;">${row.commission}</td>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0; text-align: right; white-space: nowrap; color: #b91c1c;">${row.deductions}</td>
+            <td style="padding: 10px 8px; border-bottom: 1px solid #e2e8f0; text-align: right; white-space: nowrap; font-weight: 700;">${row.netPay}</td>
+          </tr>`
+    )
+    .join('');
+
+  const emptyRow =
+    rows && rows.length > 0
+      ? ''
+      : `<tr><td colspan="5" style="padding: 16px; text-align: center; color: #64748b;">No payroll records for this period.</td></tr>`;
+
+  const totalsRow =
+    rows && rows.length > 0
+      ? `
+          <tr style="background: #ecfdf5;">
+            <td style="padding: 12px 8px; font-weight: 700;">Total (${totals.staffCount || rows.length} staff)</td>
+            <td style="padding: 12px 8px; text-align: right; font-weight: 700; white-space: nowrap;">${totals.baseSalary || '—'}</td>
+            <td style="padding: 12px 8px; text-align: right; font-weight: 700; white-space: nowrap;">${totals.commission || '—'}</td>
+            <td style="padding: 12px 8px; text-align: right; font-weight: 700; white-space: nowrap; color: #b91c1c;">${totals.deductions || '—'}</td>
+            <td style="padding: 12px 8px; text-align: right; font-weight: 700; white-space: nowrap; color: #065f46;">${totals.netPay || '—'}</td>
+          </tr>`
+      : '';
+
+  const attachmentNote =
+    attachmentCount > 0
+      ? `<div style="background: #eff6ff; border-left: 4px solid #3b82f6; padding: 14px 16px; margin-top: 20px; border-radius: 6px; color: #1e40af;">
+           <strong>${attachmentCount} salary slip PDF${attachmentCount === 1 ? '' : 's'} attached</strong> — Individual payslips for each staff member are attached to this email.
+         </div>`
+      : '';
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #334155; margin: 0; }
+        .container { max-width: 720px; margin: 0 auto; padding: 24px; }
+        .logo { max-height: 48px; max-width: 180px; display: block; margin-bottom: 16px; }
+        .branch-name { font-size: 18px; font-weight: 600; color: #1e293b; margin-bottom: 4px; }
+        .title { font-size: 20px; font-weight: 700; color: #334155; margin: 16px 0 4px; }
+        .period { color: #64748b; margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; }
+        th { background: #f8fafc; text-align: left; padding: 10px 8px; font-size: 12px; color: #475569; border-bottom: 2px solid #e2e8f0; text-transform: uppercase; letter-spacing: 0.04em; }
+        th.num { text-align: right; }
+        .footer { text-align: center; margin-top: 24px; color: #94a3b8; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        ${logoUrl ? `<img src="${logoUrl}" alt="Logo" class="logo" />` : ''}
+        <div class="branch-name">${businessName || 'EaseMySalon'}</div>
+        <div class="title">Monthly Payroll Summary</div>
+        <div class="period">${periodLabel || ''}</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Staff</th>
+              <th class="num">Base</th>
+              <th class="num">Commission</th>
+              <th class="num">Deductions</th>
+              <th class="num">Net pay</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tableRows}${emptyRow}${totalsRow}
+          </tbody>
+        </table>
+        ${attachmentNote}
+        <div class="footer">
+          <p>This is an automated email from EaseMySalon</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const textLines = [
+    businessName || 'EaseMySalon',
+    `Monthly Payroll Summary — ${periodLabel || ''}`,
+    '',
+  ];
+
+  for (const row of rows || []) {
+    textLines.push(
+      `${row.staffName || 'Staff'}${row.role ? ` (${row.role})` : ''}`,
+      `  Base: ${row.baseSalary}`,
+      `  Commission: ${row.commission}`,
+      `  Deductions: ${row.deductions}`,
+      `  Net pay: ${row.netPay}`,
+      ''
+    );
+  }
+
+  if (rows && rows.length > 0) {
+    textLines.push(
+      `Total (${totals.staffCount || rows.length} staff)`,
+      `  Base: ${totals.baseSalary || '—'}`,
+      `  Commission: ${totals.commission || '—'}`,
+      `  Deductions: ${totals.deductions || '—'}`,
+      `  Net pay: ${totals.netPay || '—'}`,
+      ''
+    );
+  }
+
+  if (attachmentCount > 0) {
+    textLines.push(`${attachmentCount} salary slip PDF(s) attached to this email.`, '');
+  }
+
+  textLines.push('This is an automated email from EaseMySalon');
+
+  return { html, text: textLines.filter(Boolean).join('\n') };
+}
+
+function staffPayrollSlip({
+  businessName,
+  periodLabel,
+  staffName,
+  role,
+  baseSalary,
+  commission,
+  deductions,
+  netPay,
+  paymentMethod,
+  paidAt,
+  logoUrl,
+  hasAttachment = true,
+}) {
+  const paidLine =
+    paidAt && paymentMethod
+      ? `<p style="margin: 12px 0 0; color: #475569; font-size: 14px;">Paid via <strong>${paymentMethod}</strong> on <strong>${paidAt}</strong></p>`
+      : '';
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #334155; margin: 0; }
+        .container { max-width: 600px; margin: 0 auto; padding: 24px; }
+        .logo { max-height: 48px; max-width: 180px; display: block; margin-bottom: 16px; }
+        .branch-name { font-size: 18px; font-weight: 600; color: #1e293b; margin-bottom: 4px; }
+        .title { font-size: 20px; font-weight: 700; color: #334155; margin: 16px 0 4px; }
+        .period { color: #64748b; margin-bottom: 20px; }
+        .staff-name { font-size: 18px; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
+        .staff-role { color: #64748b; font-size: 14px; margin-bottom: 16px; }
+        table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; }
+        th, td { padding: 12px 14px; border-bottom: 1px solid #e2e8f0; }
+        th { background: #f8fafc; text-align: left; font-size: 12px; color: #475569; text-transform: uppercase; letter-spacing: 0.04em; }
+        td.amount { text-align: right; font-weight: 600; white-space: nowrap; }
+        tr.net td { background: #ecfdf5; font-size: 16px; font-weight: 700; color: #065f46; border-bottom: none; }
+        .attachment { background: #eff6ff; border-left: 4px solid #3b82f6; padding: 14px 16px; margin-top: 20px; border-radius: 6px; color: #1e40af; }
+        .footer { text-align: center; margin-top: 24px; color: #94a3b8; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        ${logoUrl ? `<img src="${logoUrl}" alt="Logo" class="logo" />` : ''}
+        <div class="branch-name">${businessName || 'EaseMySalon'}</div>
+        <div class="title">Salary Slip</div>
+        <div class="period">${periodLabel || ''}</div>
+
+        <div class="staff-name">${staffName || 'Staff'}</div>
+        ${role ? `<div class="staff-role">${role}</div>` : ''}
+
+        <table>
+          <thead>
+            <tr>
+              <th>Component</th>
+              <th class="amount">Amount</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Base salary</td>
+              <td class="amount">${baseSalary}</td>
+            </tr>
+            <tr>
+              <td>Commission</td>
+              <td class="amount">${commission}</td>
+            </tr>
+            <tr>
+              <td>Deductions</td>
+              <td class="amount" style="color:#b91c1c;">${deductions}</td>
+            </tr>
+            <tr class="net">
+              <td>Net pay</td>
+              <td class="amount">${netPay}</td>
+            </tr>
+          </tbody>
+        </table>
+
+        ${paidLine}
+
+        ${
+          hasAttachment
+            ? `<div class="attachment"><strong>Salary slip attached</strong> — The PDF salary slip for ${staffName || 'this staff member'} is attached to this email.</div>`
+            : ''
+        }
+
+        <div class="footer">
+          <p>This is an automated email from EaseMySalon</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const text = [
+    businessName || 'EaseMySalon',
+    `Salary Slip — ${periodLabel || ''}`,
+    '',
+    staffName || 'Staff',
+    role ? `Role: ${role}` : '',
+    '',
+    `Base salary: ${baseSalary}`,
+    `Commission: ${commission}`,
+    `Deductions: ${deductions}`,
+    `Net pay: ${netPay}`,
+    paidAt && paymentMethod ? `Paid via ${paymentMethod} on ${paidAt}` : '',
+    '',
+    hasAttachment ? 'Salary slip PDF is attached to this email.' : '',
+    '',
+    'This is an automated email from EaseMySalon',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  return { html, text };
+}
+
+module.exports = {
+  dailySummary,
+  weeklySummary,
+  staffIncentiveSummary,
+  staffPayrollSlip,
+  staffPayrollSummary,
+  staffTimesheetReport,
+  receipt,
+  appointmentConfirmation,
+  appointmentReminder,
+  appointmentCancellation,
+  exportReady,
+  systemAlert,
+  lowInventory,
+  appointmentNotification,
+  appointmentCancellationNotification,
+};
+

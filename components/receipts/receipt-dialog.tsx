@@ -1,0 +1,346 @@
+"use client"
+
+import { useState, useEffect } from "react"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Textarea } from "@/components/ui/textarea"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Printer, Download, Mail, Edit, Save, X, MessageCircle } from "lucide-react"
+import type { Receipt } from "@/lib/data"
+import { ReceiptTemplateView, printReceiptWithTemplate } from "./receipt-template-view"
+import { ReceiptPrintStyles } from "./receipt-print-styles"
+import { ReceiptGenerator } from "./receipt-generator"
+import { useToast } from "@/hooks/use-toast"
+import { SettingsAPI } from "@/lib/api"
+import { useCurrency } from "@/hooks/use-currency"
+import { receiptTipDisplayLines } from "@/lib/receipt-tip-lines"
+import { isWalkInClient } from "@/lib/walk-in-client"
+
+interface ReceiptDialogProps {
+  receipt: Receipt | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onReceiptUpdate?: (receipt: Receipt) => void
+}
+
+export function ReceiptDialog({ receipt, open, onOpenChange, onReceiptUpdate }: ReceiptDialogProps) {
+  const [isEditing, setIsEditing] = useState(false)
+  const [editedReceipt, setEditedReceipt] = useState<Receipt | null>(null)
+  const [businessSettings, setBusinessSettings] = useState<any>(null)
+  const [isLoadingSettings, setIsLoadingSettings] = useState(true)
+  const { toast } = useToast()
+  const { formatAmount } = useCurrency()
+
+  // Debug logging
+  useEffect(() => {
+    console.log('🎯 ReceiptDialog Debug:')
+    console.log('Open:', open)
+    console.log('Receipt:', receipt)
+    console.log('Receipt ID:', receipt?.id)
+    console.log('Receipt Number:', receipt?.receiptNumber)
+    console.log('Receipt Items:', receipt?.items)
+  }, [open, receipt])
+
+  // Load business settings when dialog opens
+  useEffect(() => {
+    if (open && !businessSettings) {
+      const loadBusinessSettings = async () => {
+        try {
+          console.log('Loading business settings for receipt...')
+          const response = await SettingsAPI.getBusinessSettings()
+          console.log('Business settings response:', response)
+          if (response.success) {
+            setBusinessSettings(response.data)
+            console.log('Business settings loaded:', response.data)
+          }
+        } catch (error) {
+          console.error('Error loading business settings:', error)
+        } finally {
+          setIsLoadingSettings(false)
+        }
+      }
+
+      loadBusinessSettings()
+    }
+  }, [open, businessSettings])
+
+  if (!receipt) {
+    console.log('❌ ReceiptDialog: No receipt provided, returning null')
+    return null
+  }
+
+  console.log('✅ ReceiptDialog: Receipt received, rendering dialog')
+
+  // Only generate receipt functions when business settings are loaded
+  const { downloadReceipt } = ReceiptGenerator({ 
+    receipt: editedReceipt || receipt,
+    businessSettings 
+  })
+
+  const handlePrint = () => {
+    printReceiptWithTemplate(editedReceipt || receipt, businessSettings)
+  }
+
+  const handleEdit = () => {
+    setEditedReceipt({ ...receipt })
+    setIsEditing(true)
+  }
+
+  const handleSave = () => {
+    if (editedReceipt && onReceiptUpdate) {
+      onReceiptUpdate(editedReceipt)
+      setIsEditing(false)
+      setEditedReceipt(null)
+    }
+  }
+
+  const handleCancel = () => {
+    setIsEditing(false)
+    setEditedReceipt(null)
+  }
+
+  const handleEmailReceipt = () => {
+    // In a real app, this would send an email
+    toast({
+      title: "Email Sent",
+      description: "Receipt has been emailed to the customer",
+    })
+  }
+
+  const handleShareWhatsApp = () => {
+    const r = currentReceipt || receipt
+    const phone = r?.clientPhone || (r as any)?.customerPhone || ''
+    const digitsOnly = phone.replace(/\D/g, '')
+    let waPhone = digitsOnly
+    if (digitsOnly.length === 10) {
+      waPhone = '91' + digitsOnly
+    } else if (digitsOnly.length === 11 && digitsOnly.startsWith('0')) {
+      waPhone = '91' + digitsOnly.slice(1)
+    } else if (digitsOnly.length >= 10) {
+      waPhone = digitsOnly.startsWith('91') ? digitsOnly : '91' + digitsOnly.slice(-10)
+    }
+    if (!waPhone || waPhone.length < 10) {
+      toast({
+        title: "No phone number",
+        description: "Customer phone number is not available for this receipt.",
+        variant: "destructive",
+      })
+      return
+    }
+    let baseUrl = typeof window !== 'undefined' ? window.location.origin : ''
+    if (baseUrl.startsWith('https://localhost') || baseUrl.startsWith('https://127.0.0.1')) {
+      baseUrl = baseUrl.replace('https://', 'http://')
+    }
+    const publicUrl = (r as any)?.shareToken
+      ? `${baseUrl}/receipt/public/${r.receiptNumber}/${(r as any).shareToken}`
+      : `${baseUrl}/receipt/${r?.receiptNumber}`
+    const clientName = r?.clientName || (r as any)?.customerName || 'Customer'
+    const totalAmount = (r as any)?.grossTotal ?? (r as any)?.netTotal ?? r?.total ?? 0
+    const message = `Hi ${clientName},
+
+Your invoice ${r?.receiptNumber || ''} is ready.
+Total: ₹${totalAmount}
+
+View here:
+${publicUrl}`
+    const whatsappUrl = `https://wa.me/${waPhone}?text=${encodeURIComponent(message)}`
+    window.open(whatsappUrl, '_blank', 'noopener,noreferrer')
+  }
+
+  const currentReceipt = editedReceipt || receipt
+  const isWalkInReceipt = currentReceipt
+    ? isWalkInClient({
+        name: currentReceipt.clientName,
+        phone: currentReceipt.clientPhone,
+      })
+    : false
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle className="flex items-center justify-between">
+            <span>Receipt {receipt.receiptNumber}</span>
+            <div className="flex gap-2">
+              {!isEditing ? (
+                <>
+                  <Button variant="outline" size="sm" onClick={handleEdit}>
+                    <Edit className="h-4 w-4 mr-2" />
+                    Edit
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={handlePrint}>
+                    <Printer className="h-4 w-4 mr-2" />
+                    Print
+                  </Button>
+                  {!isWalkInReceipt ? (
+                    <>
+                  <Button variant="outline" size="sm" onClick={handleShareWhatsApp} className="bg-green-50 border-green-200 text-green-700 hover:bg-green-100">
+                    <MessageCircle className="h-4 w-4 mr-2" />
+                    Share via WhatsApp
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={downloadReceipt}>
+                    <Download className="h-4 w-4 mr-2" />
+                    Download
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={handleEmailReceipt}>
+                    <Mail className="h-4 w-4 mr-2" />
+                    Email
+                  </Button>
+                    </>
+                  ) : (
+                  <Button variant="outline" size="sm" onClick={downloadReceipt}>
+                    <Download className="h-4 w-4 mr-2" />
+                    Download
+                  </Button>
+                  )}
+                </>
+              ) : (
+                <>
+                  <Button variant="outline" size="sm" onClick={handleSave}>
+                    <Save className="h-4 w-4 mr-2" />
+                    Save
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={handleCancel}>
+                    <X className="h-4 w-4 mr-2" />
+                    Cancel
+                  </Button>
+                </>
+              )}
+            </div>
+          </DialogTitle>
+        </DialogHeader>
+
+        <Tabs defaultValue="preview" className="w-full">
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="preview">Preview</TabsTrigger>
+            <TabsTrigger value="edit" disabled={!isEditing}>
+              Edit Details
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="preview" className="mt-6">
+            <div className="flex justify-center">
+              {isLoadingSettings ? (
+                <div className="text-center py-8">
+                  <div className="text-lg font-medium">Loading receipt...</div>
+                  <div className="text-sm text-muted-foreground">Fetching business settings</div>
+                </div>
+              ) : (
+                <ReceiptTemplateView receipt={currentReceipt} businessSettings={businessSettings} />
+              )}
+            </div>
+          </TabsContent>
+
+          <TabsContent value="edit" className="mt-6">
+            {isEditing && editedReceipt && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="space-y-4">
+                  <div>
+                    <Label htmlFor="clientName">Client Name</Label>
+                    <Input
+                      id="clientName"
+                      value={editedReceipt.clientName}
+                      onChange={(e) => setEditedReceipt({ ...editedReceipt, clientName: e.target.value })}
+                    />
+                  </div>
+
+                  <div>
+                    <Label htmlFor="clientPhone">Client Phone</Label>
+                    <Input
+                      id="clientPhone"
+                      value={editedReceipt.clientPhone}
+                      onChange={(e) => setEditedReceipt({ ...editedReceipt, clientPhone: e.target.value })}
+                    />
+                  </div>
+
+                  <div>
+                    <Label htmlFor="staffName">Staff Name</Label>
+                    <Input
+                      id="staffName"
+                      value={editedReceipt.staffName}
+                      onChange={(e) => setEditedReceipt({ ...editedReceipt, staffName: e.target.value })}
+                    />
+                  </div>
+
+                  <div>
+                    <Label htmlFor="tip">Tip Amount</Label>
+                    <Input
+                      id="tip"
+                      type="number"
+                      step="0.01"
+                      value={editedReceipt.tip}
+                      onChange={(e) => setEditedReceipt({ ...editedReceipt, tip: Number(e.target.value) })}
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  <div>
+                    <Label htmlFor="discount">Discount Amount</Label>
+                    <Input
+                      id="discount"
+                      type="number"
+                      step="0.01"
+                      value={editedReceipt.discount}
+                      onChange={(e) => setEditedReceipt({ ...editedReceipt, discount: Number(e.target.value) })}
+                    />
+                  </div>
+
+                  <div>
+                    <Label htmlFor="notes">Notes</Label>
+                    <Textarea
+                      id="notes"
+                      value={editedReceipt.notes || ""}
+                      onChange={(e) => setEditedReceipt({ ...editedReceipt, notes: e.target.value })}
+                      placeholder="Add any notes..."
+                    />
+                  </div>
+
+                  <div className="p-4 bg-muted rounded-lg">
+                    <h4 className="font-semibold mb-2">Totals</h4>
+                    <div className="space-y-1 text-sm">
+                      <div className="flex justify-between">
+                        <span>Subtotal (Excl. Tax):</span>
+                        <span>{formatAmount((editedReceipt as any).subtotalExcludingTax ?? editedReceipt.subtotal)}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span>Discount:</span>
+                        <span>-{formatAmount(editedReceipt.discount)}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span>Tax:</span>
+                        <span>{formatAmount(editedReceipt.tax)}</span>
+                      </div>
+                      {editedReceipt.tip > 0 &&
+                        receiptTipDisplayLines(editedReceipt).map((line, i) => (
+                          <div key={i} className="flex justify-between">
+                            <span>{line.staffName ? `Tip (${line.staffName}):` : "Tip:"}</span>
+                            <span>{formatAmount(line.amount)}</span>
+                          </div>
+                        ))}
+                      <div className="flex justify-between font-semibold border-t pt-1">
+                        <span>Total:</span>
+                        <span>
+                          $
+                          {(
+                            editedReceipt.subtotal -
+                            editedReceipt.discount +
+                            editedReceipt.tax +
+                            editedReceipt.tip
+                          ).toFixed(2)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
+        <ReceiptPrintStyles businessSettings={businessSettings} />
+      </DialogContent>
+    </Dialog>
+  )
+}

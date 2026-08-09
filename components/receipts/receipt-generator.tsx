@@ -1,0 +1,351 @@
+"use client"
+
+import type { Receipt } from "@/lib/data"
+import { getReceiptGrandTotal } from "@/lib/receipt-grand-total"
+import { getReceiptSettlementSummary } from "@/lib/receipt-settlement-summary"
+import { buildReceiptRefundsSectionHtml } from "@/lib/receipt-refunds"
+import { getReceiptPaymentStamp } from "@/lib/receipt-payment-stamp"
+import { formatCurrency, getCurrencySymbol } from "@/lib/currency"
+import { formatReceiptDiscountPercent } from "@/lib/receipt-discount-format"
+import { formatReceiptItemStaffNames } from "@/lib/receipt-staff-format"
+import { receiptWalkInSaleLabel } from "@/lib/receipt-line-source"
+import { formatPaymentRecordedDateLabelFromIso, receiptPaymentTypeDisplayName } from "@/lib/sale-payment-lines"
+import { receiptTipDisplayLines } from "@/lib/receipt-tip-lines"
+import {
+  buildReceiptTaxDetailHtml,
+  renderReceiptTotalsHtml,
+} from "@/lib/receipt-totals-breakdown"
+import { shouldShowGstOnClientReceipt } from "@/lib/should-show-gst-on-client-receipt"
+
+interface ReceiptGeneratorProps {
+  receipt: Receipt
+  businessSettings?: any
+}
+
+export function ReceiptGenerator({ receipt, businessSettings }: ReceiptGeneratorProps) {
+  const generateReceiptHTML = () => {
+    if (!businessSettings) {
+      return `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Receipt ${receipt.receiptNumber}</title>
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+            .loading { font-size: 18px; color: #666; }
+          </style>
+        </head>
+        <body>
+          <div class="loading">Loading receipt...</div>
+        </body>
+        </html>
+      `
+    }
+
+    // Calculate correct tax amounts outside template literal
+    const calculateCorrectTaxAmount = () => {
+      if (receipt.taxBreakdown) {
+        const serviceTax = receipt.taxBreakdown.serviceTax || 0
+        const productTaxTotal = Object.values(receipt.taxBreakdown.productTaxByRate || {}).reduce((sum, amount) => sum + amount, 0)
+        return serviceTax + productTaxTotal
+      }
+      return receipt.tax
+    }
+
+    const calculateCorrectTotal = () => getReceiptGrandTotal(receipt)
+
+    const correctTaxAmount = calculateCorrectTaxAmount()
+    const correctTotal = calculateCorrectTotal()
+    const showGstOnReceipt = shouldShowGstOnClientReceipt(businessSettings)
+
+    return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Receipt ${receipt.receiptNumber}</title>
+        <style>
+          body {
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.4;
+            margin: 0;
+            padding: 20px;
+            max-width: 300px;
+            margin: 0 auto;
+          }
+          .header {
+            text-align: center;
+            border-bottom: 2px solid #000;
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+          }
+          .salon-name {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 5px;
+          }
+          .salon-info {
+            font-size: 10px;
+            margin-bottom: 2px;
+          }
+          .receipt-info {
+            margin-bottom: 15px;
+          }
+          .receipt-info div {
+            margin-bottom: 3px;
+          }
+          .items {
+            border-top: 1px dashed #000;
+            border-bottom: 1px dashed #000;
+            padding: 10px 0;
+            margin-bottom: 10px;
+          }
+          .item {
+            margin-bottom: 8px;
+          }
+          .item-header {
+            display: flex;
+            justify-content: space-between;
+            font-weight: bold;
+          }
+          .item-details {
+            font-size: 10px;
+            color: #666;
+            margin-left: 10px;
+          }
+          .totals {
+            margin-bottom: 15px;
+          }
+          .total-line {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 3px;
+          }
+          .total-line.grand-total {
+            font-weight: bold;
+            font-size: 14px;
+            border-top: 1px solid #000;
+            padding-top: 5px;
+            margin-top: 8px;
+          }
+          .payments {
+            margin-bottom: 15px;
+          }
+          .payment-line {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 3px;
+          }
+          .footer {
+            text-align: center;
+            border-top: 1px dashed #000;
+            padding-top: 10px;
+            font-size: 10px;
+          }
+          @media print {
+            body { margin: 0; padding: 10px; }
+            .payment-stamp { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          }
+          body { position: relative; }
+          .payment-stamp {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) rotate(-12deg);
+            padding: 6px 12px;
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            opacity: 0.85;
+            border-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+          }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          ${businessSettings.logo ? `<div class="logo-container" style="margin-bottom: 10px;"><img src="${businessSettings.logo}" alt="Business Logo" style="max-height: 60px; max-width: 60px; object-fit: contain; display: block; margin: 0 auto;"></div>` : ''}
+          <div class="salon-name">${businessSettings.name}</div>
+          <div class="salon-info">${businessSettings.address}, ${businessSettings.city}, ${businessSettings.state} ${businessSettings.zipCode}</div>
+          <div class="salon-info">Phone: ${businessSettings.phone}</div>
+          <div class="salon-info">Email: ${businessSettings.email}</div>
+          ${showGstOnReceipt ? `<div class="salon-info" style="font-weight: bold;">GST: ${businessSettings.gstNumber}</div>` : ''}
+        </div>
+
+        <div class="receipt-info">
+          <div><strong>Receipt #:</strong> ${receipt.receiptNumber}</div>
+          <div><strong>Date:</strong> ${new Date(receipt.date).toLocaleDateString()}</div>
+          <div><strong>Time:</strong> ${receipt.time}</div>
+          <div><strong>Client:</strong> ${receipt.clientName}</div>
+          <div><strong>Phone:</strong> ${receipt.clientPhone}</div>
+        </div>
+
+        <div class="items">
+          <table style="width: 100%; border-collapse: collapse; font-size: 11px;">
+            <thead>
+              <tr style="border-bottom: 1px solid #000;">
+                <th style="text-align: left; padding: 4px 2px;">HSN</th>
+                <th style="text-align: left; padding: 4px 2px;">Service/Product</th>
+                <th style="text-align: right; padding: 4px 2px;">Price</th>
+                <th style="text-align: right; padding: 4px 2px;">Disc(%)</th>
+                <th style="text-align: right; padding: 4px 2px;">Tax Rate</th>
+                <th style="text-align: right; padding: 4px 2px;">Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${receipt.items
+                .map(
+                  (item) => {
+                  const staffLabel = formatReceiptItemStaffNames(item)
+                  const walkInLabel = receiptWalkInSaleLabel(item.lineSource)
+                  const lineMeta =
+                    (staffLabel || walkInLabel) &&
+                    `${staffLabel ? `<br><span style="font-size: 10px; color: #666;">${staffLabel}</span>` : ""}${walkInLabel ? `<br><span style="font-size: 10px; color: #92400e;">${walkInLabel}</span>` : ""}`
+                  return `
+                <tr style="border-bottom: 1px dashed #999;">
+                  <td style="padding: 3px 2px;">${item.hsnSacCode || "-"}</td>
+                  <td style="padding: 3px 2px;">${item.name}${item.quantity > 1 ? ` (x${item.quantity})` : ""}${lineMeta || ""}</td>
+                  <td style="text-align: right; padding: 3px 2px;">${formatCurrency(item.price, businessSettings)}</td>
+                  <td style="text-align: right; padding: 3px 2px;">${(item.discount || 0) > 0 ? (item.discountType === "percentage" ? formatReceiptDiscountPercent(item.discount) : formatCurrency(item.discount, businessSettings)) : "-"}</td>
+                  <td style="text-align: right; padding: 3px 2px;">${((item as any).taxRate ?? 0) > 0 ? (item as any).taxRate + "%" : "-"}</td>
+                  <td style="text-align: right; padding: 3px 2px; font-weight: bold;">${formatCurrency(item.total, businessSettings)}</td>
+                </tr>
+              `
+                }
+                )
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="totals">
+          ${renderReceiptTotalsHtml(receipt, (amount) => formatCurrency(amount, businessSettings), {
+            taxDetailHtml: buildReceiptTaxDetailHtml(receipt, (amount) =>
+              formatCurrency(amount, businessSettings)
+            ),
+            grandTotalOverride: correctTotal,
+          })}
+          ${(() => {
+            const s = getReceiptSettlementSummary(receipt)
+            let out = ""
+            if (s.showReceivedAndAdjusted) {
+              out += `
+            <div class="total-line" style="margin-top: 10px; padding-top: 8px; border-top: 1px dashed #999;">
+              <span>Amount Received:</span>
+              <span>${formatCurrency(s.amountReceived, businessSettings)}</span>
+            </div>
+            <div class="total-line">
+              <span>Adjusted:</span>
+              <span>${formatCurrency(s.paidTowardBill, businessSettings)}</span>
+            </div>`
+              if (s.showWalletCreditLine) {
+                out += `
+            <div class="total-line">
+              <span>Wallet Credit:</span>
+              <span>${formatCurrency(s.walletCredit, businessSettings)}</span>
+            </div>`
+              }
+              if (s.showOutstandingLine) {
+                out += `
+            <div class="total-line" style="color: #dc2626; font-weight: 600;">
+              <span>Outstanding:</span>
+              <span>${formatCurrency(s.outstanding, businessSettings)}</span>
+            </div>`
+              }
+            }
+            out += `
+            <div class="total-line" style="margin-top: ${s.showReceivedAndAdjusted ? "8px" : "10px"}; padding-top: 6px; border-top: ${s.showReceivedAndAdjusted ? "1px solid #bbb" : "1px dashed #bbb"}; font-weight: 600;">
+              <span>Total Paid (Bill):</span>
+              <span>${formatCurrency(s.effectivePaidTowardBill, businessSettings)}</span>
+            </div>`
+            return out
+          })()}
+        </div>
+
+        <div class="payments">
+          <div style="font-weight: bold; margin-bottom: 5px;">Payment Method(s):</div>
+          ${receipt.payments
+            .map(
+              (payment) => {
+                // Safely handle payment types with null/undefined checks
+                if (!payment || !payment.type) {
+                  const d = formatPaymentRecordedDateLabelFromIso(payment?.recordedAt)
+                  const left = d ? `Unknown (${d})` : "Unknown"
+                  return `
+            <div class="payment-line">
+              <span>${left}:</span>
+              <span>${formatCurrency(payment?.amount || 0, businessSettings)}</span>
+            </div>
+          `
+                }
+                
+                const displayName = receiptPaymentTypeDisplayName(payment.type)
+                const dateSuffix = formatPaymentRecordedDateLabelFromIso(payment.recordedAt)
+                const labelWithDate = dateSuffix ? `${displayName} (${dateSuffix})` : displayName
+                
+                return `
+            <div class="payment-line">
+              <span>${labelWithDate}:</span>
+              <span>${formatCurrency(payment.amount, businessSettings)}</span>
+            </div>
+          `
+              }
+            )
+            .join("")}
+        </div>
+        ${buildReceiptRefundsSectionHtml(
+          getReceiptSettlementSummary(receipt).refundLines,
+          (amount) => formatCurrency(amount, businessSettings),
+        )}
+
+        <div class="footer">
+          <div>Thank you for visiting!</div>
+          <div>We appreciate your business</div>
+          <div style="margin-top: 10px;">
+            Follow us on social media<br>
+            ${businessSettings.socialMedia}
+          </div>
+        </div>
+        ${(() => {
+          const stamp = getReceiptPaymentStamp(receipt as any, correctTotal);
+          return `<div class="payment-stamp" style="border: 2px solid ${stamp.color}; color: ${stamp.color};">${stamp.checkPrefix}${stamp.label}</div>`;
+        })()}
+      </body>
+      </html>
+    `
+  }
+
+  const printReceipt = () => {
+    const printWindow = window.open("", "_blank")
+    if (printWindow) {
+      printWindow.document.write(generateReceiptHTML())
+      printWindow.document.close()
+      printWindow.focus()
+      setTimeout(() => {
+        printWindow.print()
+        printWindow.close()
+      }, 250)
+    }
+  }
+
+  const downloadReceipt = () => {
+    const html = generateReceiptHTML()
+    const blob = new Blob([html], { type: "text/html" })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = `receipt-${receipt.receiptNumber}.html`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
+
+  return {
+    generateReceiptHTML,
+    printReceipt,
+    downloadReceipt,
+  }
+}

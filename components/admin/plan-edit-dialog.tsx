@@ -1,0 +1,554 @@
+"use client"
+
+import { useState, useEffect } from "react"
+import { Save, History } from "lucide-react"
+
+import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Input } from "@/components/ui/input"
+import { Switch } from "@/components/ui/switch"
+import { Textarea } from "@/components/ui/textarea"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { useToast } from "@/hooks/use-toast"
+import { Badge } from "@/components/ui/badge"
+import { adminRequestHeaders } from "@/lib/admin-request-headers"
+import { preparePlanFeaturesForAdminUi, GMB_BUNDLE_ID, hasGmbBundle } from "@/lib/plan-feature-bundles"
+import {
+  buildPlanFeatureOverridesFromBusiness,
+  isGmbBundleEnabled,
+  isPlanFeatureEnabled,
+  toggleGmbBundleOverride,
+  togglePlanFeatureOverride,
+} from "@/lib/admin-plan-feature-overrides"
+
+interface PlanEditDialogProps {
+  businessId: string
+  businessName: string
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onSuccess?: () => void
+  onClosed?: () => void
+}
+
+export function PlanEditDialog({ businessId, businessName, open, onOpenChange, onSuccess, onClosed }: PlanEditDialogProps) {
+  const [loading, setLoading] = useState(false)
+  const [plans, setPlans] = useState<any[]>([])
+  const [features, setFeatures] = useState<any[]>([])
+  const [planInfo, setPlanInfo] = useState<any>(null)
+  const [history, setHistory] = useState<any[]>([])
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false)
+  const { toast } = useToast()
+
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001/api'
+
+  const [formData, setFormData] = useState({
+    planId: 'starter',
+    billingPeriod: 'monthly',
+    renewalDate: '',
+    isTrial: false,
+    trialEndsAt: '',
+    overrides: {
+      features: [] as string[],
+      disabledFeatures: [] as string[],
+      expiresAt: '',
+      notes: '',
+    },
+    addons: {
+      whatsapp: { enabled: false, quota: 0 },
+      waba: { enabled: false, quota: 0 },
+      sms: { enabled: false, quota: 0 },
+      googleBusiness: { enabled: false, quota: 0 },
+    },
+  })
+
+  useEffect(() => {
+    if (open && businessId) {
+      void (async () => {
+        const configPlans = await fetchConfig()
+        await fetchBusinessPlan(configPlans)
+      })()
+    }
+    if (!open) {
+      setIsHistoryOpen(false)
+    }
+  }, [open, businessId])
+
+  const fetchConfig = async () => {
+    try {
+      const response = await fetch(`${API_URL}/admin/plans/config`, {
+        headers: adminRequestHeaders(),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        if (data.success) {
+          setPlans(data.data.plans)
+          setFeatures(preparePlanFeaturesForAdminUi(data.data.features))
+          return data.data.plans as any[]
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching config:', error)
+    }
+    return []
+  }
+
+  const fetchBusinessPlan = async (configPlans: any[] = plans) => {
+    try {
+      setLoading(true)
+      const response = await fetch(`${API_URL}/admin/plans/business/${businessId}`, {
+        headers: adminRequestHeaders(),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        if (data.success) {
+          const business = data.data.business
+          setPlanInfo(business.plan)
+          const planFeatures = configPlans.find((p: any) => p.id === business.plan.planId)?.features || []
+          const effectiveFeatures = business.features
+            ? business.features.filter((f: any) => f.enabled).map((f: any) => f.id)
+            : business.plan.features || []
+          setFormData({
+            planId: business.plan.planId,
+            billingPeriod: business.plan.billingPeriod,
+            renewalDate: business.plan.renewalDate ? new Date(business.plan.renewalDate).toISOString().split('T')[0] : '',
+            isTrial: business.plan.isTrial,
+            trialEndsAt: business.plan.trialEndsAt ? new Date(business.plan.trialEndsAt).toISOString().split('T')[0] : '',
+            overrides: buildPlanFeatureOverridesFromBusiness(
+              planFeatures,
+              effectiveFeatures,
+              business.overrides,
+            ),
+            addons: {
+              whatsapp: {
+                enabled: business.plan.addons?.whatsapp?.enabled || false,
+                quota: business.plan.addons?.whatsapp?.quota || 0,
+              },
+              waba: {
+                enabled: business.plan.addons?.waba?.enabled || false,
+                quota: business.plan.addons?.waba?.quota || 0,
+              },
+              sms: {
+                enabled: business.plan.addons?.sms?.enabled || false,
+                quota: business.plan.addons?.sms?.quota || 0,
+              },
+              googleBusiness: {
+                enabled: business.plan.addons?.googleBusiness?.enabled || false,
+                quota: business.plan.addons?.googleBusiness?.quota || 0,
+              },
+            },
+          })
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching business plan:', error)
+      toast({
+        title: "Error",
+        description: "Failed to fetch plan information",
+        variant: "destructive",
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleViewHistory = async () => {
+    try {
+      const response = await fetch(`${API_URL}/admin/plans/business/${businessId}/history`, {
+        headers: adminRequestHeaders(),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        if (data.success) {
+          setHistory(data.data.history)
+          setIsHistoryOpen(true)
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching history:', error)
+    }
+  }
+
+  const handleSave = async () => {
+    try {
+      setLoading(true)
+      const response = await fetch(`${API_URL}/admin/plans/business/${businessId}`, {
+        method: 'PUT',
+        headers: adminRequestHeaders({
+          'Content-Type': 'application/json',
+        }),
+        body: JSON.stringify({
+          ...formData,
+          reason: formData.overrides.notes || 'Plan updated by admin',
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        if (data.success) {
+          toast({
+            title: "Success",
+            description: "Plan updated successfully",
+          })
+          onOpenChange(false)
+          onSuccess?.()
+        }
+      } else {
+        const error = await response.json()
+        toast({
+          title: "Error",
+          description: error.error || "Failed to update plan",
+          variant: "destructive",
+        })
+      }
+    } catch (error) {
+      console.error('Error updating plan:', error)
+      toast({
+        title: "Error",
+        description: "Failed to update plan",
+        variant: "destructive",
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const toggleFeatureOverride = (featureId: string) => {
+    setFormData({
+      ...formData,
+      overrides:
+        featureId === GMB_BUNDLE_ID
+          ? toggleGmbBundleOverride(planFeatures, formData.overrides)
+          : togglePlanFeatureOverride(featureId, planFeatures, formData.overrides),
+    })
+  }
+
+  const planFeatures = plans.find(p => p.id === formData.planId)?.features || []
+
+  return (
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent
+          className="max-w-4xl max-h-[90vh] overflow-y-auto"
+          onCloseAutoFocus={() => onClosed?.()}
+        >
+          <DialogHeader>
+            <DialogTitle>Manage Plan: {businessName}</DialogTitle>
+            <DialogDescription>
+              Update plan, billing period, and feature access
+            </DialogDescription>
+          </DialogHeader>
+
+          {loading && !planInfo ? (
+            <div className="flex items-center justify-center py-8">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+            </div>
+          ) : (
+            <Tabs defaultValue="plan" className="w-full">
+              <TabsList>
+                <TabsTrigger value="plan">Plan & Billing</TabsTrigger>
+                <TabsTrigger value="features">Feature Overrides</TabsTrigger>
+                <TabsTrigger value="addons">Add-ons</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="plan" className="space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <Label>Plan</Label>
+                    <Select
+                      value={formData.planId}
+                      onValueChange={(value) => {
+                        const newPlanFeatures = plans.find((p) => p.id === value)?.features || []
+                        setFormData({
+                          ...formData,
+                          planId: value,
+                          overrides: {
+                            ...formData.overrides,
+                            features: formData.overrides.features.filter((id) => !newPlanFeatures.includes(id)),
+                            disabledFeatures: formData.overrides.disabledFeatures.filter((id) => newPlanFeatures.includes(id)),
+                          },
+                        })
+                      }}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {plans.map((plan) => (
+                          <SelectItem key={plan.id} value={plan.id}>
+                            {plan.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div>
+                    <Label>Billing Period</Label>
+                    <Select value={formData.billingPeriod} onValueChange={(value) => setFormData({ ...formData, billingPeriod: value })}>
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="monthly">Monthly</SelectItem>
+                        <SelectItem value="yearly">Yearly</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div>
+                    <Label>Renewal Date</Label>
+                    <Input
+                      type="date"
+                      value={formData.renewalDate}
+                      onChange={(e) => setFormData({ ...formData, renewalDate: e.target.value })}
+                    />
+                  </div>
+
+                  <div className="flex items-center space-x-2 pt-6">
+                    <Switch
+                      checked={formData.isTrial}
+                      onCheckedChange={(checked) => setFormData({ ...formData, isTrial: checked })}
+                    />
+                    <Label>Is Trial</Label>
+                  </div>
+
+                  {formData.isTrial && (
+                    <div>
+                      <Label>Trial Ends At</Label>
+                      <Input
+                        type="date"
+                        value={formData.trialEndsAt}
+                        onChange={(e) => setFormData({ ...formData, trialEndsAt: e.target.value })}
+                      />
+                    </div>
+                  )}
+                </div>
+              </TabsContent>
+
+              <TabsContent value="features" className="space-y-4">
+                <div>
+                  <Label>Feature Access</Label>
+                  <p className="text-sm text-gray-500 mb-4">
+                    Toggle any feature on or off for this business. Plan defaults are shown as &quot;(in plan)&quot;.
+                    Disabled plan features stay off until re-enabled; extra grants can expire below.
+                  </p>
+                  <div className="grid grid-cols-2 gap-2 max-h-64 overflow-y-auto border rounded p-4">
+                    {features.map((feature) => {
+                      const isInPlan =
+                        feature.id === GMB_BUNDLE_ID
+                          ? hasGmbBundle(planFeatures)
+                          : planFeatures.includes(feature.id)
+                      const isGranted = formData.overrides.features.includes(feature.id)
+                      const isDisabled = formData.overrides.disabledFeatures.includes(feature.id)
+                      const isEnabled =
+                        feature.id === GMB_BUNDLE_ID
+                          ? isGmbBundleEnabled(planFeatures, formData.overrides)
+                          : isPlanFeatureEnabled(feature.id, planFeatures, formData.overrides)
+
+                      return (
+                        <div key={feature.id} className="flex items-center space-x-2">
+                          <Switch
+                            checked={isEnabled}
+                            onCheckedChange={() => toggleFeatureOverride(feature.id)}
+                          />
+                          <Label className="text-sm">
+                            {feature.name}
+                            {isInPlan && <span className="text-gray-400 ml-1">(in plan)</span>}
+                            {!isInPlan && isGranted && <span className="text-blue-600 ml-1">(granted)</span>}
+                            {isInPlan && isDisabled && <span className="text-red-600 ml-1">(disabled)</span>}
+                          </Label>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                <div>
+                  <Label>Override Expiry Date (Optional)</Label>
+                  <Input
+                    type="date"
+                    value={formData.overrides.expiresAt}
+                    onChange={(e) => setFormData({
+                      ...formData,
+                      overrides: { ...formData.overrides, expiresAt: e.target.value },
+                    })}
+                  />
+                </div>
+
+                <div>
+                  <Label>Notes</Label>
+                  <Textarea
+                    value={formData.overrides.notes}
+                    onChange={(e) => setFormData({
+                      ...formData,
+                      overrides: { ...formData.overrides, notes: e.target.value },
+                    })}
+                    placeholder="Reason for override..."
+                  />
+                </div>
+              </TabsContent>
+
+              <TabsContent value="addons" className="space-y-4">
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between p-4 border rounded">
+                    <div>
+                      <Label className="text-base font-semibold">WhatsApp Notifications</Label>
+                      <p className="text-sm text-gray-500">
+                        Transactional WhatsApp via Gupshup — receipts, appointment confirmations,
+                        reminders, etc. Requires WABA add-on for templates, campaigns, and inbox.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={formData.addons.whatsapp.enabled}
+                      onCheckedChange={(checked) => setFormData({
+                        ...formData,
+                        addons: {
+                          ...formData.addons,
+                          whatsapp: { ...formData.addons.whatsapp, enabled: checked },
+                        },
+                      })}
+                    />
+                  </div>
+                  {formData.addons.whatsapp.enabled && (
+                    <div className="rounded-md border border-blue-100 bg-blue-50/60 p-3 text-xs text-blue-900">
+                      WhatsApp messages are billed per message from the business
+                      wallet (₹0.20 transactional, ₹1.20 campaign). No free quota.
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between p-4 border rounded">
+                    <div>
+                      <Label className="text-base font-semibold">WABA Integration (Gupshup)</Label>
+                      <p className="text-sm text-gray-500">
+                        Gupshup WhatsApp pipeline — templates, campaigns, inbox, opt-out,
+                        webhook-driven status. Uses the shared platform number until the business
+                        connects their own app in Settings → WhatsApp Integration.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={formData.addons.waba.enabled}
+                      onCheckedChange={(checked) => setFormData({
+                        ...formData,
+                        addons: {
+                          ...formData.addons,
+                          waba: { ...formData.addons.waba, enabled: checked },
+                        },
+                      })}
+                    />
+                  </div>
+                  {formData.addons.waba.enabled && (
+                    <div className="rounded-md border border-emerald-100 bg-emerald-50/70 p-3 text-xs text-emerald-900">
+                      WABA add-on enabled. Templates, Campaigns, Inbox, and Settings → WhatsApp
+                      Integration are unlocked. Sends route via Gupshup (own app when connected,
+                      otherwise the shared platform number).
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between p-4 border rounded">
+                    <div>
+                      <Label className="text-base font-semibold">Google Business Profile Booster</Label>
+                      <p className="text-sm text-gray-500">
+                        AI auto-reply, WhatsApp review requests, auto posts, insights, and ad triggers (₹499/mo)
+                      </p>
+                    </div>
+                    <Switch
+                      checked={formData.addons.googleBusiness.enabled}
+                      onCheckedChange={(checked) => setFormData({
+                        ...formData,
+                        addons: {
+                          ...formData.addons,
+                          googleBusiness: { ...formData.addons.googleBusiness, enabled: checked },
+                        },
+                      })}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between p-4 border rounded">
+                    <div>
+                      <Label className="text-base font-semibold">SMS Notifications</Label>
+                      <p className="text-sm text-gray-500">Send SMS notifications</p>
+                    </div>
+                    <Switch
+                      checked={formData.addons.sms.enabled}
+                      onCheckedChange={(checked) => setFormData({
+                        ...formData,
+                        addons: {
+                          ...formData.addons,
+                          sms: { ...formData.addons.sms, enabled: checked },
+                        },
+                      })}
+                    />
+                  </div>
+                  {formData.addons.sms.enabled && (
+                    <div className="rounded-md border border-blue-100 bg-blue-50/60 p-3 text-xs text-blue-900">
+                      SMS messages are billed per message from the business
+                      wallet (₹0.20 per message). No free quota.
+                    </div>
+                  )}
+                </div>
+              </TabsContent>
+            </Tabs>
+          )}
+
+          <DialogFooter>
+            <Button variant="outline" onClick={handleViewHistory}>
+              <History className="h-4 w-4 mr-2" />
+              View History
+            </Button>
+            <Button variant="outline" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+            <Button onClick={handleSave} disabled={loading}>
+              <Save className="h-4 w-4 mr-2" />
+              Save Changes
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* History Dialog */}
+      <Dialog open={isHistoryOpen} onOpenChange={setIsHistoryOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Plan Change History</DialogTitle>
+            <DialogDescription>
+              Audit trail of all plan changes for {businessName}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-96 overflow-y-auto">
+            {history.length === 0 ? (
+              <div className="text-center py-8 text-gray-500">No history available</div>
+            ) : (
+              <div className="space-y-2">
+                {history.map((entry) => (
+                  <div key={entry._id} className="border rounded p-3">
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <div className="font-semibold text-sm">{entry.changeType}</div>
+                        <div className="text-xs text-gray-500 mt-1">
+                          {entry.reason || 'No reason provided'}
+                        </div>
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        {new Date(entry.createdAt).toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="text-xs text-gray-400 mt-2">
+                      Changed by: {entry.changedBy?.email || 'Unknown'}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+

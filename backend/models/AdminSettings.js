@@ -1,0 +1,724 @@
+const mongoose = require('mongoose');
+const { logger } = require('../utils/logger');
+
+const adminSettingsSchema = new mongoose.Schema({
+  // System Configuration
+  system: {
+    inactiveBusinessMonitoring: {
+      enabled: { type: Boolean, default: true },
+      daysThreshold: { type: Number, default: 30 },
+      action: { type: String, enum: ['notify', 'suspend', 'delete'], default: 'notify' }
+    },
+    sessionManagement: {
+      maxSessionDuration: { type: Number, default: 24 },
+      enableSessionTimeout: { type: Boolean, default: true },
+      sessionTimeoutMinutes: { type: Number, default: 30 }
+    },
+    security: {
+      enableTwoFactor: { type: Boolean, default: false },
+      passwordPolicy: {
+        minLength: { type: Number, default: 8 },
+        requireUppercase: { type: Boolean, default: true },
+        requireLowercase: { type: Boolean, default: true },
+        requireNumbers: { type: Boolean, default: true },
+        requireSpecialChars: { type: Boolean, default: false }
+      }
+    },
+    monitoring: {
+      enableHealthChecks: { type: Boolean, default: true },
+      healthCheckInterval: { type: Number, default: 5 },
+      enablePerformanceMonitoring: { type: Boolean, default: true }
+    }
+  },
+  
+  // Business Management
+  business: {
+    defaultSettings: {
+      currency: { type: String, default: 'INR' },
+      timezone: { type: String, default: 'Asia/Kolkata' },
+      dateFormat: { type: String, default: 'DD/MM/YYYY' }
+    },
+    creationRules: {
+      requireEmailVerification: { type: Boolean, default: false },
+      autoApprove: { type: Boolean, default: true },
+      maxBusinessesPerUser: { type: Number, default: 1 }
+    }
+  },
+  
+  // User Management
+  users: {
+    defaultRole: { type: String, default: 'staff' },
+    enableUserRegistration: { type: Boolean, default: false },
+    requireEmailVerification: { type: Boolean, default: false }
+  },
+  
+  // Database & System
+  database: {
+    backupFrequency: { type: String, enum: ['daily', 'weekly', 'monthly'], default: 'daily' },
+    enableAutoBackup: { type: Boolean, default: true },
+    retentionDays: { type: Number, default: 30 }
+  },
+  
+  // Notifications & Alerts
+  notifications: {
+    email: {
+      enabled: { type: Boolean, default: true },
+      provider: { type: String, enum: ['resend', 'smtp', 'sendgrid', 'ses', 'mailgun'], default: 'resend' },
+      // Resend configuration
+      resendApiKey: { type: String, default: '' },
+      // SMTP configuration
+      smtpHost: { type: String, default: 'smtp.gmail.com' },
+      smtpPort: { type: Number, default: 587 },
+      smtpSecure: { type: Boolean, default: false },
+      smtpUser: { type: String, default: '' },
+      smtpPassword: { type: String, default: '' },
+      // SendGrid configuration
+      sendgridApiKey: { type: String, default: '' },
+      // AWS SES configuration
+      sesAccessKeyId: { type: String, default: '' },
+      sesSecretAccessKey: { type: String, default: '' },
+      sesRegion: { type: String, default: 'us-east-1' },
+      // Mailgun configuration
+      mailgunApiKey: { type: String, default: '' },
+      mailgunDomain: { type: String, default: '' },
+      // Common settings
+      fromEmail: { type: String, default: 'noreply@easemysalon.in' },
+      fromName: { type: String, default: 'EaseMySalon' },
+      replyTo: { type: String, default: 'support@easemysalon.in' },
+      maxRetries: { type: Number, default: 3 },
+      retryDelay: { type: Number, default: 5000 }
+    },
+    sms: {
+      enabled: { type: Boolean, default: false },
+      provider: { type: String, enum: ['twilio', 'aws', 'nexmo', 'textlocal', 'msg91'], default: 'twilio' },
+      twilioAccountSid: { type: String, default: '' },
+      twilioAuthToken: { type: String, default: '' },
+      twilioFromNumber: { type: String, default: '' },
+      awsAccessKeyId: { type: String, default: '' },
+      awsSecretAccessKey: { type: String, default: '' },
+      awsRegion: { type: String, default: 'us-east-1' },
+      msg91AuthKey: { type: String, default: '' },
+      templates: {
+        receipt: { type: String, default: '' },
+        appointmentConfirmation: { type: String, default: '' },
+        appointmentCancellation: { type: String, default: '' },
+        test: { type: String, default: '' }
+      },
+      // Optional: map MSG91 variables to receipt fields (e.g. { VAR1: 'clientName', VAR2: 'businessName', VAR3: 'total', VAR4: 'receiptNumber' })
+      receiptVariableMapping: { type: mongoose.Schema.Types.Mixed, default: undefined },
+      maxRetries: { type: Number, default: 3 },
+      retryDelay: { type: Number, default: 5000 }
+    },
+    whatsapp: {
+      enabled: { type: Boolean, default: false },
+      provider: { type: String, enum: ['gupshup'], default: 'gupshup' },
+      /**
+       * Shared platform Gupshup app used as the transactional fallback sender
+       * when a salon has not connected its own app. The partner credentials +
+       * app id live in env (GUPSHUP_*); these mirror the resolved values for
+       * admin display. Template slots below hold Gupshup template ids when
+       * provider === 'gupshup'.
+       */
+      gupshupAppId: { type: String, default: '' },
+      gupshupAppName: { type: String, default: '' },
+      gupshupSourceNumber: { type: String, default: '' },
+      /** Cached platform app token (encrypted) — avoids partner login on every send. */
+      gupshupAppTokenCipher: { type: String, default: '' },
+      /** Partner Portal login email (env GUPSHUP_EMAIL takes precedence). */
+      gupshupPartnerEmail: { type: String, default: '' },
+      /** Encrypted client secret (env GUPSHUP_CLIENT_SECRET takes precedence). */
+      gupshupClientSecretCipher: { type: String, default: '' },
+      /** Public delivery webhook URL registered with Gupshup (overrides auto-detect). */
+      gupshupWebhookUrl: { type: String, default: '' },
+      // Template IDs for different notification types
+      templates: {
+        welcomeMessage: { type: String, default: '' }, // Welcome message
+        platformLeadWelcome: { type: String, default: '' }, // Platform lead welcome (prospect)
+        businessAccountCreated: { type: String, default: '' }, // Business account created
+        receipt: { type: String, default: '' }, // Sending bills/receipts (View Bill only)
+        receiptWithFeedback: { type: String, default: '' }, // Receipt + Share Feedback buttons
+        receiptCancellation: { type: String, default: '' }, // Bill cancellation
+        appointmentScheduling: { type: String, default: '' }, // Appointment scheduling
+        appointmentConfirmation: { type: String, default: '' }, // Appointment confirmation
+        appointmentCancellation: { type: String, default: '' }, // Appointment cancellation
+        appointmentReminder: { type: String, default: '' }, // Appointment reminder
+        appointmentReschedule: { type: String, default: '' }, // Appointment reschedule
+        clientWalletTransaction: { type: String, default: '' }, // Prepaid wallet credit/debit/adjustment/refund
+        clientWalletExpiryReminder: { type: String, default: '' }, // Prepaid wallet 30/15/7-day expiry reminder
+        clientDuesReminder: { type: String, default: '' }, // Outstanding bill dues reminder
+        clientBirthdayReminder: { type: String, default: '' }, // Birthday wish on client's DOB
+        default: { type: String, default: '' } // Default/fallback template
+      },
+      // Template variable mappings — body_1/body_2/… → CRM data fields.
+      // Auto-populated from Platform Template Manager (Gupshup) or default slot presets.
+      // Example: { clientDuesReminder: { body_1: 'clientName', body_2: 'duesAmountFormatted', body_3: 'businessName' } }
+      templateVariables: {
+        type: mongoose.Schema.Types.Mixed,
+        default: {}
+      },
+      /** @deprecated Legacy MSG91 API sample paste — no longer used in admin UI */
+      templateJavaScriptCodes: {
+        type: mongoose.Schema.Types.Mixed,
+        default: {}
+      },
+      // Legacy: Keep for backward compatibility
+      msg91TemplateId: { type: String, default: '' },
+      // Template configuration
+      templateIncludesBaseUrl: { type: Boolean, default: true }, // If true, template already has base URL, only pass path variables
+      templateIncludesGoogleMapsBaseUrl: { type: Boolean, default: true }, // If true, MSG91 template URL is https://maps.app.goo.gl/{{1}} — send slug only
+      // Notification preferences (system defaults)
+      receiptNotifications: { type: Boolean, default: true },
+      appointmentNotifications: { type: Boolean, default: true },
+      systemAlerts: { type: Boolean, default: false },
+      /** Platform default: allow prepaid wallet ledger WhatsApp when template configured */
+      clientWalletTransactionNotifications: {
+        type: mongoose.Schema.Types.Mixed,
+        default: () => ({ enabled: true }),
+      },
+      clientWalletExpiryReminderNotifications: {
+        type: mongoose.Schema.Types.Mixed,
+        default: () => ({ enabled: true }),
+      },
+      clientDuesReminderNotifications: {
+        type: mongoose.Schema.Types.Mixed,
+        default: () => ({ enabled: true }),
+      },
+      clientBirthdayReminderNotifications: {
+        type: mongoose.Schema.Types.Mixed,
+        default: () => ({ enabled: true }),
+      },
+      /** Auto WhatsApp welcome to new platform leads (shared Gupshup app). */
+      platformLeadWelcomeNotifications: {
+        type: mongoose.Schema.Types.Mixed,
+        default: () => ({ enabled: true }),
+      },
+      quietHours: {
+        enabled: { type: Boolean, default: false },
+        start: { type: String, default: '22:00' },
+        end: { type: String, default: '08:00' }
+      },
+      maxRetries: { type: Number, default: 3 },
+      retryDelay: { type: Number, default: 5000 }
+    },
+    templates: {
+      businessCreated: {
+        subject: { type: String, default: 'Welcome to EaseMySalon - Business Account Created' },
+        body: { type: String, default: 'Your business account has been successfully created. Business Code: {businessCode}' },
+        enabled: { type: Boolean, default: true }
+      },
+      businessInactive: {
+        subject: { type: String, default: 'Business Account Inactive - Action Required' },
+        body: { type: String, default: 'Your business account has been marked as inactive due to no login activity for {days} days.' },
+        enabled: { type: Boolean, default: true }
+      },
+      systemAlert: {
+        subject: { type: String, default: 'System Alert - {alertType}' },
+        body: { type: String, default: 'System alert: {message}. Please check the admin panel for details.' },
+        enabled: { type: Boolean, default: true }
+      },
+      userCreated: {
+        subject: { type: String, default: 'Welcome to EaseMySalon - User Account Created' },
+        body: { type: String, default: 'Your user account has been created. Please log in to access the system.' },
+        enabled: { type: Boolean, default: true }
+      },
+      receiptNotification: {
+        subject: { type: String, default: 'Receipt {receiptNumber} - {businessName}' },
+        body: { type: String, default: 'Dear {clientName},\n\nThank you for your visit!\n\n{receiptLink}\n\nThank you for choosing {businessName}!' },
+        enabled: { type: Boolean, default: true }
+      },
+      appointmentNotification: {
+        subject: { type: String, default: 'Appointment Confirmation - {date}' },
+        body: { type: String, default: 'Dear {clientName},\n\nYour appointment has been confirmed!\n\nAppointment Details:\nService: {serviceName}\nDate: {date}\nTime: {time}\nStaff: {staffName}\nBusiness: {businessName}\nPhone: {businessPhone}\n\n{notes}\n\nWe look forward to seeing you!' },
+        enabled: { type: Boolean, default: true }
+      },
+      platformLeadPending: {
+        subject: {
+          type: String,
+          default: 'New platform lead — pending assignment',
+        },
+        body: {
+          type: String,
+          default:
+            'A new lead was added to Lead Management and needs an assignee. Open the admin panel to assign.',
+        },
+        enabled: { type: Boolean, default: true },
+      },
+      dailySummary: {
+        subject: { type: String, default: 'Daily Summary Report - {date}' },
+        body: { type: String, default: '' },
+        enabled: { type: Boolean, default: true },
+      },
+      weeklySummary: {
+        subject: { type: String, default: 'Weekly Business Summary - {weekStart} to {weekEnd}' },
+        body: { type: String, default: '' },
+        enabled: { type: Boolean, default: true },
+      },
+      staffIncentiveSummary: {
+        subject: { type: String, default: 'Staff Incentive Summary — {periodLabel}' },
+        body: { type: String, default: '' },
+        enabled: { type: Boolean, default: true },
+      },
+    },
+    alerts: {
+      systemHealth: {
+        enabled: { type: Boolean, default: true },
+        cpuThreshold: { type: Number, default: 80 },
+        memoryThreshold: { type: Number, default: 85 },
+        diskThreshold: { type: Number, default: 90 },
+        recipients: [{ type: String }]
+      },
+      businessInactive: {
+        enabled: { type: Boolean, default: true },
+        daysThreshold: { type: Number, default: 7 },
+        recipients: [{ type: String }]
+      },
+      errorAlerts: {
+        enabled: { type: Boolean, default: true },
+        errorLevel: { type: String, enum: ['error', 'warn', 'info'], default: 'error' },
+        recipients: [{ type: String }]
+      },
+      securityAlerts: {
+        enabled: { type: Boolean, default: true },
+        failedLoginThreshold: { type: Number, default: 5 },
+        recipients: [{ type: String }]
+      }
+    },
+    preferences: {
+      realTimeNotifications: { type: Boolean, default: true },
+      digestNotifications: { type: Boolean, default: false },
+      digestFrequency: { type: String, enum: ['hourly', 'daily', 'weekly'], default: 'daily' },
+      quietHours: {
+        enabled: { type: Boolean, default: false },
+        start: { type: String, default: '22:00' },
+        end: { type: String, default: '08:00' }
+      },
+      channels: {
+        email: { type: Boolean, default: true },
+        sms: { type: Boolean, default: false },
+        inApp: { type: Boolean, default: true }
+      }
+    },
+    /** Seasonal top-nav banners keyed by theme (admin Notifications → Banner). */
+    navBanners: {
+      type: mongoose.Schema.Types.Mixed,
+      default: () => ({
+        fathers_day: {
+          enabled: false,
+          expiresAt: '',
+          headline: "Happy Father's Day",
+          tagline: 'Treat Dad to a grooming session',
+        },
+      }),
+    },
+  },
+  
+  // API & Integration
+  // Note: the admin UI's "API & Integration" category submits several sibling
+  // keys (authentication, rateLimiting, integrations, webhooks, security) that
+  // are merged into `api` by updateSettings(). Those keys are declared Mixed so
+  // the full payload (payment gateway credentials, webhook configs, etc.) is
+  // actually persisted — otherwise strict mode silently drops them on save.
+  api: {
+    version: { type: String, default: 'v1' },
+    baseUrl: { type: String, default: 'https://api.ease-my-salon.com' },
+    timeout: { type: Number, default: 30000 },
+    maxRequestsPerMinute: { type: Number, default: 100 },
+    enableCORS: { type: Boolean, default: true },
+    allowedOrigins: [{ type: String }],
+    enableRateLimiting: { type: Boolean, default: true },
+    enableLogging: { type: Boolean, default: true },
+    enableMetrics: { type: Boolean, default: true },
+    authentication: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+    rateLimiting: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+    integrations: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+    webhooks: { type: mongoose.Schema.Types.Mixed, default: () => [] },
+    security: { type: mongoose.Schema.Types.Mixed, default: () => ({}) }
+  },
+
+  // Tax-invoice issuer (wallet recharges). Global — there's one invoice
+  // issuer for the whole platform (EaseMySalon), which is what bills each
+  // business for wallet top-ups. Reader: backend/lib/send-wallet-invoice.js.
+  invoice: {
+    seller: {
+      name: { type: String, default: '' },
+      address: { type: String, default: '' }, // multi-line, \n-separated
+      gstin: { type: String, default: '' },
+      state: { type: String, default: '' },
+      stateCode: { type: String, default: '' },
+      email: { type: String, default: '' },
+      phone: { type: String, default: '' },
+      website: { type: String, default: '' },
+    },
+    // Prefix for wallet recharge invoices (e.g. "EMS/WLT/2026-27/00042").
+    invoicePrefix: { type: String, default: 'EMS/WLT' },
+    // Prefix for plan subscription invoices (e.g. "EMS/SUB/2026-27/00042").
+    planInvoicePrefix: { type: String, default: 'EMS/SUB' },
+    // GST rate applied on top of the wallet-credit base. 0.18 → 18%.
+    gstRate: { type: Number, default: 0.18, min: 0, max: 1 },
+  }
+}, {
+  timestamps: true
+});
+
+// Create a singleton document
+adminSettingsSchema.statics.getSettings = async function() {
+  let settings = await this.findOne();
+  if (!settings) {
+    settings = await this.create({});
+  }
+  
+  // Ensure WhatsApp settings structure exists with proper defaults
+  if (!settings.notifications) {
+    settings.notifications = {};
+  }
+  const { migrateLegacyNavBanner, buildDefaultNavBannersSettings } = require('../lib/nav-banner-config');
+  if (!settings.notifications.navBanners) {
+    settings.notifications = migrateLegacyNavBanner(settings.notifications);
+    if (!settings.notifications.navBanners) {
+      settings.notifications.navBanners = buildDefaultNavBannersSettings();
+    }
+    await settings.save();
+  }
+  if (!settings.notifications.whatsapp) {
+    settings.notifications.whatsapp = {
+      enabled: false,
+      provider: 'gupshup',
+      templateIncludesBaseUrl: true,
+      templateIncludesGoogleMapsBaseUrl: true,
+      templates: {
+        welcomeMessage: '',
+        platformLeadWelcome: '',
+        businessAccountCreated: '',
+        receipt: '',
+        receiptWithFeedback: '',
+        receiptCancellation: '',
+        appointmentScheduling: '',
+        appointmentConfirmation: '',
+        appointmentCancellation: '',
+        appointmentReminder: '',
+        appointmentReschedule: '',
+        clientWalletTransaction: '',
+        clientWalletExpiryReminder: '',
+        clientDuesReminder: '',
+        clientBirthdayReminder: '',
+        default: ''
+      },
+      templateVariables: {},
+      templateJavaScriptCodes: {},
+      receiptNotifications: true,
+      appointmentNotifications: true,
+      systemAlerts: false,
+      clientWalletTransactionNotifications: { enabled: true },
+      clientWalletExpiryReminderNotifications: { enabled: true },
+      clientDuesReminderNotifications: { enabled: true },
+      clientBirthdayReminderNotifications: { enabled: true },
+      quietHours: {
+        enabled: false,
+        start: '22:00',
+        end: '08:00'
+      }
+    };
+    await settings.save();
+  } else {
+    // Legacy installs stored msg91/meta; schema now only allows gupshup.
+    let waLegacyMigrate = false;
+    const waProvider = settings.notifications.whatsapp.provider;
+    if (waProvider && waProvider !== 'gupshup') {
+      settings.notifications.whatsapp.provider = 'gupshup';
+      settings.markModified('notifications.whatsapp');
+      waLegacyMigrate = true;
+    }
+    // Ensure enabled field exists, but only set to false if it's truly undefined
+    // Don't overwrite existing false/true values
+    if (!settings.notifications.whatsapp.hasOwnProperty('enabled')) {
+      settings.notifications.whatsapp.enabled = false;
+      waLegacyMigrate = true;
+    }
+    if (waLegacyMigrate) {
+      await settings.save();
+    }
+  }
+  
+  if (settings) {
+    // Ensure new templates are added to existing settings
+    const defaultTemplates = {
+      businessCreated: {
+        subject: 'Welcome to EaseMySalon - Business Account Created',
+        body: 'Your business account has been successfully created. Business Code: {businessCode}',
+        enabled: true,
+      },
+      businessInactive: {
+        subject: 'Business Account Inactive - Action Required',
+        body: 'Your business account has been marked as inactive due to no login activity for {days} days.',
+        enabled: true,
+      },
+      systemAlert: {
+        subject: 'System Alert - {alertType}',
+        body: 'System alert: {message}. Please check the admin panel for details.',
+        enabled: true,
+      },
+      userCreated: {
+        subject: 'Welcome to EaseMySalon - User Account Created',
+        body: 'Your user account has been created. Please log in to access the system.',
+        enabled: true,
+      },
+      platformLeadPending: {
+        subject: 'New platform lead — pending assignment',
+        body: 'A new lead was added to Lead Management and needs an assignee. Open the admin panel to assign.',
+        enabled: true,
+      },
+      receiptNotification: {
+        subject: 'Receipt {receiptNumber} - {businessName}',
+        body: 'Dear {clientName},\n\nThank you for your visit!\n\n{receiptLink}\n\nThank you for choosing {businessName}!',
+        enabled: true,
+      },
+      appointmentNotification: {
+        subject: 'Appointment Confirmation - {date}',
+        body: 'Dear {clientName},\n\nYour appointment has been confirmed!\n\nAppointment Details:\nService: {serviceName}\nDate: {date}\nTime: {time}\nStaff: {staffName}\nBusiness: {businessName}\nPhone: {businessPhone}\n\n{notes}\n\nWe look forward to seeing you!',
+        enabled: true,
+      },
+      dailySummary: {
+        subject: 'Daily Summary Report - {date}',
+        body: '',
+        enabled: true,
+      },
+      weeklySummary: {
+        subject: 'Weekly Business Summary - {weekStart} to {weekEnd}',
+        body: '',
+        enabled: true,
+      },
+      staffIncentiveSummary: {
+        subject: 'Staff Incentive Summary — {periodLabel}',
+        body: '',
+        enabled: true,
+      },
+    };
+
+    // Merge missing templates
+    if (!settings.notifications) {
+      settings.notifications = {};
+    }
+    if (!settings.notifications.templates) {
+      settings.notifications.templates = {};
+    }
+
+    // Add missing templates and mark for save
+    let needsSave = false;
+    Object.keys(defaultTemplates).forEach(templateKey => {
+      if (!settings.notifications.templates[templateKey]) {
+        settings.notifications.templates[templateKey] = defaultTemplates[templateKey];
+        needsSave = true;
+      }
+    });
+
+    if (needsSave) {
+      settings.markModified('notifications.templates');
+    }
+
+    // Merge missing MSG91 template *slots* under notifications.whatsapp.templates
+    if (settings.notifications.whatsapp) {
+      const waDefaultTemplateIds = {
+        welcomeMessage: '',
+        platformLeadWelcome: '',
+        businessAccountCreated: '',
+        receipt: '',
+        receiptWithFeedback: '',
+        receiptCancellation: '',
+        appointmentScheduling: '',
+        appointmentConfirmation: '',
+        appointmentCancellation: '',
+        appointmentReminder: '',
+        appointmentReschedule: '',
+        clientWalletTransaction: '',
+        clientWalletExpiryReminder: '',
+        clientDuesReminder: '',
+        clientBirthdayReminder: '',
+        platformLeadWelcome: '',
+        default: '',
+      };
+      const tmpl = settings.notifications.whatsapp.templates || {};
+      settings.notifications.whatsapp.templates = tmpl;
+      let waMerge = false;
+      for (const [k, v] of Object.entries(waDefaultTemplateIds)) {
+        if (tmpl[k] === undefined) {
+          tmpl[k] = v;
+          waMerge = true;
+        }
+      }
+      if (settings.notifications.whatsapp.clientWalletTransactionNotifications == null) {
+        settings.notifications.whatsapp.clientWalletTransactionNotifications = { enabled: true };
+        waMerge = true;
+      }
+      if (settings.notifications.whatsapp.clientWalletExpiryReminderNotifications == null) {
+        settings.notifications.whatsapp.clientWalletExpiryReminderNotifications = { enabled: true };
+        waMerge = true;
+      }
+      if (settings.notifications.whatsapp.clientDuesReminderNotifications == null) {
+        settings.notifications.whatsapp.clientDuesReminderNotifications = { enabled: true };
+        waMerge = true;
+      }
+      if (settings.notifications.whatsapp.clientBirthdayReminderNotifications == null) {
+        settings.notifications.whatsapp.clientBirthdayReminderNotifications = { enabled: true };
+        waMerge = true;
+      }
+      if (settings.notifications.whatsapp.platformLeadWelcomeNotifications == null) {
+        settings.notifications.whatsapp.platformLeadWelcomeNotifications = { enabled: true };
+        waMerge = true;
+      }
+      if (waMerge) {
+        settings.markModified('notifications.whatsapp.templates');
+        settings.markModified('notifications.whatsapp.clientWalletTransactionNotifications');
+        needsSave = true;
+      }
+    }
+
+    // Update old receiptNotification template format to new simplified format
+    const receiptTemplate = settings.notifications.templates.receiptNotification;
+    if (receiptTemplate && receiptTemplate.body) {
+      const oldFormatIndicators = [
+        'Please find the PDF receipt attached',
+        'Items:',
+        'Subtotal:',
+        'Payment Method:'
+      ];
+      const hasOldFormat = oldFormatIndicators.some(indicator => 
+        receiptTemplate.body.includes(indicator)
+      );
+      
+      if (hasOldFormat) {
+        logger.debug('🔄 Updating old receiptNotification template to new format');
+        settings.notifications.templates.receiptNotification = {
+          subject: 'Receipt {receiptNumber} - {businessName}',
+          body: 'Dear {clientName},\n\nThank you for your visit!\n\n{receiptLink}\n\nThank you for choosing {businessName}!',
+          enabled: receiptTemplate.enabled !== false
+        };
+        needsSave = true;
+      }
+    }
+
+    // Save if we added new templates or updated old ones
+    if (needsSave) {
+      await settings.save();
+    }
+  }
+
+  // Ensure invoice prefix fields exist on older settings documents
+  if (!settings.invoice) {
+    settings.invoice = {};
+  }
+  let invoiceNeedsSave = false;
+  if (!settings.invoice.invoicePrefix) {
+    settings.invoice.invoicePrefix = 'EMS/WLT';
+    invoiceNeedsSave = true;
+  }
+  if (!settings.invoice.planInvoicePrefix) {
+    settings.invoice.planInvoicePrefix = 'EMS/SUB';
+    invoiceNeedsSave = true;
+  }
+  if (invoiceNeedsSave) {
+    settings.markModified('invoice');
+    await settings.save();
+  }
+
+  return settings;
+};
+
+adminSettingsSchema.statics.updateSettings = async function(category, updates) {
+  const settings = await this.getSettings();
+  
+  // Deep merge function for nested objects
+  const deepMerge = (target, source) => {
+    for (const key in source) {
+      // Check if the value exists (including false, 0, empty string, null, undefined)
+      // Use hasOwnProperty to check if key exists, and check if value is not undefined
+      if (source.hasOwnProperty(key) && source[key] !== undefined) {
+        // Check if it's an object that should be merged (not null, not array, not Date, not ObjectId)
+        if (source[key] !== null && typeof source[key] === 'object' && !Array.isArray(source[key]) && !(source[key] instanceof Date) && !(source[key] instanceof mongoose.Types.ObjectId)) {
+          if (!target[key] || typeof target[key] !== 'object') {
+            target[key] = {};
+          }
+          deepMerge(target[key], source[key]);
+        } else {
+          // For primitives (including false, 0, empty string), boolean false, etc., directly assign
+          target[key] = source[key];
+        }
+      }
+    }
+  };
+  
+  if (category) {
+    // Deep merge for nested objects like notifications.whatsapp and notifications.sms
+    if (category === 'notifications' && (updates.whatsapp || updates.sms)) {
+      if (!settings[category]) {
+        settings[category] = {};
+      }
+      if (updates.whatsapp) {
+        if (!settings[category].whatsapp) {
+          settings[category].whatsapp = {};
+        }
+        deepMerge(settings[category].whatsapp, updates.whatsapp);
+        settings.markModified(`notifications.whatsapp.templateJavaScriptCodes`);
+        settings.markModified(`notifications.whatsapp.templateVariables`);
+        settings.markModified('notifications.whatsapp');
+      }
+      if (updates.sms) {
+        if (!settings[category].sms) {
+          settings[category].sms = {};
+        }
+        deepMerge(settings[category].sms, updates.sms);
+        settings.markModified('notifications.sms');
+      }
+      // Merge other notification keys (email, etc.)
+      Object.keys(updates).forEach(key => {
+        if (key !== 'whatsapp' && key !== 'sms') {
+          if (!settings[category][key]) {
+            settings[category][key] = {};
+          }
+          deepMerge(settings[category][key], updates[key]);
+        }
+      });
+    } else {
+      // For other categories, use deep merge
+      if (!settings[category]) {
+        settings[category] = {};
+      }
+      deepMerge(settings[category], updates);
+    }
+  } else {
+    deepMerge(settings, updates);
+  }
+
+  // The `api` category stores several Mixed sub-paths (integrations,
+  // authentication, rateLimiting, webhooks, security). Mongoose cannot auto-
+  // detect writes inside Mixed fields, so we must mark them modified
+  // explicitly — otherwise razorpay/stripe/zoho credentials silently fail to save.
+  if (category === 'api') {
+    ['authentication', 'rateLimiting', 'integrations', 'webhooks', 'security'].forEach(key => {
+      if (updates && Object.prototype.hasOwnProperty.call(updates, key)) {
+        settings.markModified(`api.${key}`);
+      }
+    });
+  }
+
+  // Invoice subdoc — mark the whole branch modified so nested changes (e.g.
+  // a single seller field) are always persisted even if Mongoose doesn't
+  // pick up the diff through deepMerge on a freshly-initialised subdoc.
+  if (category === 'invoice') {
+    settings.markModified('invoice');
+  }
+
+  // notifications.navBanners is Schema.Types.Mixed — assign + markModified (deepMerge alone does not persist).
+  if (category === 'notifications' && Object.prototype.hasOwnProperty.call(updates, 'navBanners')) {
+    settings.notifications.navBanners = JSON.parse(JSON.stringify(updates.navBanners));
+    settings.markModified('notifications.navBanners');
+  }
+
+  await settings.save();
+  return settings;
+};
+
+module.exports = {
+  schema: adminSettingsSchema,
+  model: mongoose.model('AdminSettings', adminSettingsSchema)
+};
+

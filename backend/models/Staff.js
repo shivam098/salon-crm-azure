@@ -1,0 +1,164 @@
+const mongoose = require('mongoose');
+
+const staffSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: true
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    lowercase: true
+  },
+  phone: {
+    type: String,
+    required: true
+  },
+  /** Base64 data URL or external image URL for staff profile photo */
+  avatar: {
+    type: String,
+    default: '',
+  },
+  role: {
+    type: String,
+    enum: ['admin', 'manager', 'staff'],
+    required: true
+  },
+  specialties: [{
+    type: String
+  }],
+  salary: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  commissionProfileIds: [{
+    type: String
+  }],
+  password: {
+    type: String
+  },
+  notes: {
+    type: String,
+    default: ''
+  },
+  hasLoginAccess: {
+    type: Boolean,
+    default: false
+  },
+  allowAppointmentScheduling: {
+    type: Boolean,
+    default: false
+  },
+  isPublic: { type: Boolean, default: false },
+  isFeatured: { type: Boolean, default: false },
+  displayOrder: { type: Number, default: 0 },
+  slug: { type: String, trim: true, lowercase: true, default: '' },
+  shortDescription: { type: String, default: '', maxlength: 500 },
+  title: { type: String, default: '' },
+  isActive: {
+    type: Boolean,
+    default: true
+  },
+  workSchedule: [{
+    day: { type: Number, required: true, min: 0, max: 6 }, // 0 = Sunday, 6 = Saturday
+    enabled: { type: Boolean, default: true },
+    startTime: { type: String, default: '09:00' }, // 24h "HH:mm"
+    endTime: { type: String, default: '21:00' }    // 24h "HH:mm"
+  }],
+  /** Assigned shift from Attendance & Payroll settings (attendance.shifts) */
+  shiftId: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  /**
+   * Per-staff overrides on business Attendance & Payroll rules. When
+   * useBusinessRules is true (default) the business defaults apply; individual
+   * fields override only when useBusinessRules is false.
+   */
+  payrollOverrides: {
+    useBusinessRules: { type: Boolean, default: true },
+    salary: { type: Number, default: null },
+    lateDeductionEnabled: { type: Boolean, default: null },
+    overtimeEnabled: { type: Boolean, default: null },
+    commissionPercent: { type: Number, default: null },
+  },
+  permissions: [{
+    module: { type: String, required: true },
+    feature: { type: String, required: true },
+    enabled: { type: Boolean, default: false }
+  }],
+  // Last selected role template in permissions modal: "admin" | "manager" | "staff" | "custom"
+  permissionsTemplate: { type: String, default: null },
+  branchId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Business',
+    required: true
+  },
+  consentPreferences: {
+    type: {
+      necessary: { type: Boolean, default: true },
+      analytics: { type: Boolean, default: false },
+      functional: { type: Boolean, default: false },
+      marketing: { type: Boolean, default: false },
+      dataProcessing: { type: Boolean, default: true },
+      dataSharing: { type: Boolean, default: false }
+    },
+    default: null
+  },
+  consentUpdatedAt: {
+    type: Date,
+    default: null
+  },
+  // Email Notification Preferences (Managed by Admin)
+  emailNotifications: {
+    enabled: {
+      type: Boolean,
+      default: false
+    },
+    preferences: {
+      dailySummary: { type: Boolean, default: false },
+      weeklySummary: { type: Boolean, default: false },
+      monthlySummary: { type: Boolean, default: false },
+      staffIncentiveSummary: { type: Boolean, default: false },
+      payrollSlip: { type: Boolean, default: false },
+      timesheetReport: { type: Boolean, default: false },
+      appointmentAlerts: { type: Boolean, default: false },
+      receiptAlerts: { type: Boolean, default: false },
+      exportAlerts: { type: Boolean, default: false },
+      systemAlerts: { type: Boolean, default: false },
+      lowInventory: { type: Boolean, default: false },
+      /** When true (manager/staff only), include this staff email in report export delivery */
+      allowReportsDelivery: { type: Boolean, default: false }
+    },
+    managedBy: {
+      type: String,
+      enum: ['admin'],
+      default: 'admin'
+    },
+    lastUpdatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    lastUpdatedAt: {
+      type: Date
+    }
+  }
+}, {
+  timestamps: true
+});
+
+// Indexes: branch directory and login lookup (email unique globally)
+staffSchema.index({ branchId: 1, isActive: 1 });
+staffSchema.index({ branchId: 1, role: 1 });
+staffSchema.index({ branchId: 1, createdAt: -1 });
+staffSchema.index({ branchId: 1, isPublic: 1 });
+staffSchema.index({ branchId: 1, slug: 1 });
+
+// Export both schema and model for flexibility
+module.exports = {
+  schema: staffSchema,
+  model: mongoose.model('Staff', staffSchema)
+}; 

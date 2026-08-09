@@ -1,0 +1,260 @@
+"use client"
+
+import { useState, useEffect } from "react"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
+import { useToast } from "@/components/ui/use-toast"
+import { SettingsAPI } from "@/lib/api"
+import { useInvalidatePaymentSettings } from "@/lib/queries/payment-settings"
+import { useAuth } from "@/lib/auth-context"
+import {
+  mergePaymentConfiguration,
+  type PaymentConfiguration,
+} from "@/lib/payment-redemption-eligibility"
+import { Settings, Receipt, Lock } from "lucide-react"
+
+function ToggleRow({
+  label,
+  checked,
+  onCheckedChange,
+  disabled,
+}: {
+  label: string
+  checked: boolean
+  onCheckedChange: (v: boolean) => void
+  disabled?: boolean
+}) {
+  return (
+    <div className="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
+      <Label className="text-sm text-slate-700 font-normal cursor-pointer">{label}</Label>
+      <Switch checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} />
+    </div>
+  )
+}
+
+export function PaymentSettings() {
+  const { hasPermission } = useAuth()
+  const canEdit = hasPermission("payment_settings", "edit")
+  const [settings, setSettings] = useState({
+    processingFee: "2.9",
+    enableProcessingFees: true,
+    paymentConfiguration: mergePaymentConfiguration(null),
+  })
+  const [isLoading, setIsLoading] = useState(false)
+  const [isSaving, setIsSaving] = useState(false)
+  const { toast } = useToast()
+  const invalidatePaymentSettings = useInvalidatePaymentSettings()
+
+  useEffect(() => {
+    void loadPaymentSettings()
+  }, [])
+
+  const loadPaymentSettings = async () => {
+    setIsLoading(true)
+    try {
+      const response = await SettingsAPI.getPaymentSettings()
+      if (response.success && response.data) {
+        setSettings({
+          processingFee: response.data.processingFee?.toString() || "2.9",
+          enableProcessingFees: response.data.enableProcessingFees !== false,
+          paymentConfiguration: mergePaymentConfiguration(response.data.paymentConfiguration),
+        })
+      }
+    } catch {
+      toast({
+        title: "Error",
+        description: "Failed to load payment settings. Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+
+  const patchBilling = (patch: Partial<PaymentConfiguration["billingRedemption"]>) => {
+    setSettings((s) => ({
+      ...s,
+      paymentConfiguration: mergePaymentConfiguration({
+        ...s.paymentConfiguration,
+        billingRedemption: { ...s.paymentConfiguration.billingRedemption, ...patch },
+      }),
+    }))
+  }
+
+  const handleSave = async () => {
+    setIsSaving(true)
+    try {
+      const response = await SettingsAPI.updatePaymentSettings({
+        processingFee: parseFloat(settings.processingFee),
+        enableProcessingFees: settings.enableProcessingFees,
+        paymentConfiguration: settings.paymentConfiguration,
+      })
+
+      if (response.success) {
+        invalidatePaymentSettings()
+        toast({
+          title: "Payment settings saved",
+          description: "Your payment configuration has been updated.",
+        })
+      } else {
+        throw new Error(response.error || "Failed to save settings")
+      }
+    } catch {
+      toast({
+        title: "Error",
+        description: "Failed to save payment settings. Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const pc = settings.paymentConfiguration
+
+  if (isLoading) {
+    return (
+      <div className="space-y-6">
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+          <div className="p-6">
+            <div className="flex items-center gap-4 mb-2">
+              <div className="p-2 bg-blue-50 rounded-lg">
+                <Settings className="h-5 w-5 text-blue-600" />
+              </div>
+              <div>
+                <h2 className="text-2xl font-bold text-slate-800">Payment Configuration</h2>
+                <p className="text-slate-600">Loading payment settings...</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+        <div className="p-6">
+          <div className="flex items-center gap-4 mb-2">
+            <div className="p-2 bg-blue-50 rounded-lg">
+              <Settings className="h-5 w-5 text-blue-600" />
+            </div>
+            <div>
+              <h2 className="text-2xl font-bold text-slate-800">Payment Configuration</h2>
+              <p className="text-slate-600">Configure payment methods, tax settings, and billing options</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-6">
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+          <div className="p-6">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="w-10 h-10 bg-gradient-to-r from-blue-100 to-indigo-100 rounded-lg flex items-center justify-center">
+                <Settings className="h-5 w-5 text-blue-600" />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-slate-800">Payment Processing</h3>
+                <p className="text-slate-600 text-sm">Configure payment processing fees and methods</p>
+              </div>
+            </div>
+
+            <div className="space-y-6">
+              <div className="flex items-center justify-between p-4 bg-slate-50 rounded-xl">
+                <div className="space-y-1">
+                  <Label className="text-sm font-medium text-slate-700">Enable Processing Fees</Label>
+                  <p className="text-sm text-slate-600">Add processing fees to card payments</p>
+                </div>
+                <Switch
+                  checked={settings.enableProcessingFees}
+                  onCheckedChange={(checked) => setSettings({ ...settings, enableProcessingFees: checked })}
+                />
+              </div>
+
+              {settings.enableProcessingFees && (
+                <div className="space-y-3">
+                  <Label htmlFor="processingFee" className="text-sm font-medium text-slate-700">
+                    Processing Fee (%)
+                  </Label>
+                  <Input
+                    id="processingFee"
+                    type="number"
+                    step="0.01"
+                    value={settings.processingFee}
+                    onChange={(e) => setSettings({ ...settings, processingFee: e.target.value })}
+                    className="border-slate-200 focus:border-blue-500 focus:ring-blue-500"
+                  />
+                  <p className="text-sm text-slate-500">
+                    This fee will be added to card payments to cover processing costs
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Redemption Rules */}
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+          <div className="p-6">
+            <div className="flex items-center gap-3 mb-2">
+              <div className="w-10 h-10 bg-gradient-to-r from-violet-100 to-indigo-100 rounded-lg flex items-center justify-center">
+                <Receipt className="h-5 w-5 text-violet-700" />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-slate-800">Redemption Rules</h3>
+                <p className="text-slate-600 text-sm">
+                  Billing options for wallet and reward points at checkout. Line-type rules are under Settings →
+                  Prepaid wallet and Reward points.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-6 space-y-6">
+              <div className="rounded-xl border border-slate-200 p-4 bg-slate-50/50">
+                <div className="flex items-center gap-2 mb-3">
+                  <Receipt className="h-4 w-4 text-slate-600" />
+                  <h4 className="text-sm font-semibold text-slate-800">Billing redemption</h4>
+                </div>
+                <ToggleRow
+                  label="Allow redemption during billing"
+                  checked={pc.billingRedemption.allowRedemptionInBilling !== false}
+                  onCheckedChange={(v) => patchBilling({ allowRedemptionInBilling: v })}
+                />
+                <ToggleRow
+                  label="Allow combining wallet balance and reward points in a single bill"
+                  checked={pc.billingRedemption.allowWalletAndPointsTogether !== false}
+                  disabled={pc.billingRedemption.allowRedemptionInBilling === false}
+                  onCheckedChange={(v) => patchBilling({ allowWalletAndPointsTogether: v })}
+                />
+                <p className="text-xs text-slate-500 mt-2">
+                  When the second option is off, staff must choose either wallet or reward points per bill at
+                  checkout (Quick Sale).
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex justify-end items-center gap-3">
+        {!canEdit && (
+          <span className="text-xs text-muted-foreground inline-flex items-center gap-1">
+            <Lock className="h-3 w-3" /> You don't have permission to edit payment settings
+          </span>
+        )}
+        <Button
+          onClick={() => void handleSave()}
+          disabled={isSaving || !canEdit}
+          className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-2.5 shadow-md hover:shadow-lg transition-all duration-300 rounded-lg font-medium disabled:opacity-60"
+        >
+          {isSaving ? "Saving..." : "Save Changes"}
+        </Button>
+      </div>
+    </div>
+  )
+}

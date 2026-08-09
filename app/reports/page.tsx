@@ -1,0 +1,269 @@
+"use client"
+
+import { Suspense, useEffect, useMemo, useState } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
+import { ProtectedLayout } from "@/components/layout/protected-layout"
+import { Card, CardContent } from "@/components/ui/card"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { ProtectedRoute } from "@/components/auth/protected-route"
+import { SalesReport } from "@/components/reports/sales-report"
+import { MembershipReport } from "@/components/reports/membership-report"
+import { ExpenseReport } from "@/components/reports/expense-report"
+import { StaffPerformanceReport } from "@/components/reports/staff-performance-report"
+import { PackageReport } from "@/components/reports/package-report"
+import { WhatsAppMessagesReport } from "@/components/reports/whatsapp-messages-report"
+import { BarChart3, TrendingUp, Receipt, Users, CreditCard, Package, MessageCircle } from "lucide-react"
+import { useAuth } from "@/lib/auth-context"
+import { useFeature } from "@/hooks/use-entitlements"
+import { PageSkeleton } from "@/components/loading"
+
+function ReportsTabsBody() {
+  const { user, hasPermission } = useAuth()
+  const { hasAccess: canIncentiveManagement, isLoading: entitlementsLoading } = useFeature("incentive_management")
+  const { hasAccess: canMembership, isLoading: membershipEntitlementsLoading } = useFeature("membership")
+  const { hasAccess: canPackages, isLoading: packagesEntitlementsLoading } = useFeature("packages")
+  const { hasAccess: canWhatsAppIntegration, isLoading: whatsAppEntitlementsLoading } =
+    useFeature("whatsapp_integration")
+  const router = useRouter()
+  const searchParams = useSearchParams()
+
+  const canViewFinancialReports = !user || hasPermission("reports", "view_financial_reports")
+  const canViewMembershipReports =
+    canViewFinancialReports && !membershipEntitlementsLoading && canMembership
+  const canViewStaffCommission =
+    (!user || hasPermission("reports", "view_staff_commission")) &&
+    !entitlementsLoading &&
+    canIncentiveManagement
+  const canViewPackageReports =
+    (!user || hasPermission("packages", "view")) && !packagesEntitlementsLoading && canPackages
+
+  const allowedTabs = useMemo(() => {
+    const t: string[] = []
+    if (canViewFinancialReports) t.push("sales", "expense")
+    if (canViewMembershipReports) t.push("membership")
+    if (canViewStaffCommission) t.push("staff")
+    if (canViewPackageReports) t.push("package")
+    if (!whatsAppEntitlementsLoading && canWhatsAppIntegration) t.push("messages")
+    return t
+  }, [
+    canViewFinancialReports,
+    canViewMembershipReports,
+    canViewStaffCommission,
+    canViewPackageReports,
+    canWhatsAppIntegration,
+    whatsAppEntitlementsLoading,
+  ])
+
+  const tabCount = allowedTabs.length
+
+  /**
+   * The grid must size each tab equally on the lg breakpoint, otherwise the
+   * "leftover" tab (e.g. Messages when 6 are visible against a 5-column grid)
+   * wraps onto its own row and stretches full-width — which is what looked
+   * broken before this fix. We always pick `lg:grid-cols-N` matching the
+   * exact tab count and let smaller breakpoints stack to 2-3 columns.
+   */
+  const tabGridClass =
+    tabCount <= 1
+      ? "grid-cols-1"
+      : tabCount === 2
+        ? "grid-cols-2"
+        : tabCount === 3
+          ? "grid-cols-3"
+          : tabCount === 4
+            ? "grid-cols-2 sm:grid-cols-4"
+            : tabCount === 5
+              ? "grid-cols-2 sm:grid-cols-3 lg:grid-cols-5"
+              : tabCount === 6
+                ? "grid-cols-2 sm:grid-cols-3 lg:grid-cols-6"
+                : "grid-cols-2 sm:grid-cols-3 lg:grid-cols-7"
+
+  const [activeTab, setActiveTab] = useState<string>(() => {
+    const u = searchParams.get("tab")
+    if (u && allowedTabs.includes(u)) return u
+    return allowedTabs[0] || "sales"
+  })
+
+  useEffect(() => {
+    const u = searchParams.get("tab")
+    if (u && allowedTabs.includes(u)) {
+      setActiveTab(u)
+      return
+    }
+    setActiveTab(prev => (allowedTabs.includes(prev) ? prev : allowedTabs[0] || "sales"))
+  }, [searchParams, allowedTabs])
+
+  const onTabChange = (value: string) => {
+    setActiveTab(value)
+    router.replace(`/reports?tab=${value}`, { scroll: false })
+  }
+
+  return (
+    <div className="bg-background">
+      <div className="mb-8">
+        <div className="bg-card rounded-2xl shadow-sm border border-slate-100 dark:border-border overflow-hidden">
+          <div className="bg-gradient-to-r from-blue-50 via-indigo-50 to-purple-50 dark:from-muted/80 dark:via-muted/60 dark:to-card px-8 py-6">
+            <div className="flex items-center gap-4">
+              <div className="p-3 bg-white dark:bg-card rounded-xl shadow-sm border border-transparent dark:border-border">
+                <BarChart3 className="h-7 w-7 text-blue-600 dark:text-blue-400" />
+              </div>
+              <div>
+                <h1 className="text-3xl font-bold text-slate-800 dark:text-foreground">Business Reports</h1>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-card rounded-2xl shadow-sm border border-slate-100 dark:border-border overflow-hidden">
+        <div className="p-6">
+          <Tabs value={activeTab} onValueChange={onTabChange} className="space-y-6">
+            <TabsList className={`grid w-full bg-slate-100 dark:bg-muted p-1 rounded-lg gap-1 ${tabGridClass}`}>
+              {canViewFinancialReports && (
+                <>
+                  <TabsTrigger
+                    value="sales"
+                    className="data-[state=active]:bg-white dark:data-[state=active]:bg-card data-[state=active]:text-blue-600 dark:data-[state=active]:text-blue-400 data-[state=active]:shadow-sm rounded-md transition-all duration-200"
+                  >
+                    <TrendingUp className="h-4 w-4 mr-2 shrink-0" />
+                    Sales
+                  </TabsTrigger>
+                  {canViewMembershipReports ? (
+                    <TabsTrigger
+                      value="membership"
+                      className="data-[state=active]:bg-white dark:data-[state=active]:bg-card data-[state=active]:text-blue-600 dark:data-[state=active]:text-blue-400 data-[state=active]:shadow-sm rounded-md transition-all duration-200"
+                    >
+                      <CreditCard className="h-4 w-4 mr-2 shrink-0" />
+                      Membership
+                    </TabsTrigger>
+                  ) : null}
+                  <TabsTrigger
+                    value="expense"
+                    className="data-[state=active]:bg-white dark:data-[state=active]:bg-card data-[state=active]:text-blue-600 dark:data-[state=active]:text-blue-400 data-[state=active]:shadow-sm rounded-md transition-all duration-200"
+                  >
+                    <Receipt className="h-4 w-4 mr-2 shrink-0" />
+                    Expense
+                  </TabsTrigger>
+                </>
+              )}
+              {canViewStaffCommission && (
+                <TabsTrigger
+                  value="staff"
+                  className="data-[state=active]:bg-white dark:data-[state=active]:bg-card data-[state=active]:text-blue-600 dark:data-[state=active]:text-blue-400 data-[state=active]:shadow-sm rounded-md transition-all duration-200"
+                >
+                  <Users className="h-4 w-4 mr-2 shrink-0" />
+                  Staff Performance
+                </TabsTrigger>
+              )}
+              {canViewPackageReports && (
+                <TabsTrigger
+                  value="package"
+                  className="data-[state=active]:bg-white dark:data-[state=active]:bg-card data-[state=active]:text-blue-600 dark:data-[state=active]:text-blue-400 data-[state=active]:shadow-sm rounded-md transition-all duration-200"
+                >
+                  <Package className="h-4 w-4 mr-2 shrink-0" />
+                  Package
+                </TabsTrigger>
+              )}
+              {!whatsAppEntitlementsLoading && canWhatsAppIntegration ? (
+              <TabsTrigger
+                value="messages"
+                className="data-[state=active]:bg-white dark:data-[state=active]:bg-card data-[state=active]:text-blue-600 dark:data-[state=active]:text-blue-400 data-[state=active]:shadow-sm rounded-md transition-all duration-200"
+              >
+                <MessageCircle className="h-4 w-4 mr-2 shrink-0" />
+                Messages
+              </TabsTrigger>
+              ) : null}
+            </TabsList>
+
+            {/**
+             * Render only the active tab's report. Radix `TabsContent` mounts every child
+             * even when hidden; without this gate every report fires its initial API call on
+             * page load, multiplying Railway egress for users who only view one tab.
+             */}
+            {canViewFinancialReports && (
+              <>
+                <TabsContent value="sales" className="space-y-6">
+                  {activeTab === "sales" && (
+                    <Card className="border-0 dark:border dark:border-border shadow-sm bg-slate-50/50 dark:bg-muted/30">
+                      <CardContent className="pt-6">
+                        <SalesReport />
+                      </CardContent>
+                    </Card>
+                  )}
+                </TabsContent>
+
+                <TabsContent value="membership" className="space-y-6">
+                  {activeTab === "membership" && canViewMembershipReports && (
+                    <Card className="border-0 dark:border dark:border-border shadow-sm bg-slate-50/50 dark:bg-muted/30">
+                      <CardContent className="pt-6">
+                        <MembershipReport />
+                      </CardContent>
+                    </Card>
+                  )}
+                </TabsContent>
+
+                <TabsContent value="expense" className="space-y-6">
+                  {activeTab === "expense" && (
+                    <Card className="border-0 dark:border dark:border-border shadow-sm bg-slate-50/50 dark:bg-muted/30">
+                      <CardContent className="pt-6">
+                        <ExpenseReport />
+                      </CardContent>
+                    </Card>
+                  )}
+                </TabsContent>
+              </>
+            )}
+
+            {canViewStaffCommission && (
+              <TabsContent value="staff" className="space-y-6">
+                {activeTab === "staff" && (
+                  <Card className="border-0 dark:border dark:border-border shadow-sm bg-slate-50/50 dark:bg-muted/30">
+                    <CardContent className="pt-6">
+                      <StaffPerformanceReport />
+                    </CardContent>
+                  </Card>
+                )}
+              </TabsContent>
+            )}
+
+            {canViewPackageReports && (
+              <TabsContent value="package" className="space-y-6">
+                <Card className="border-0 dark:border dark:border-border shadow-sm bg-slate-50/50 dark:bg-muted/30">
+                  <CardContent className="pt-6">
+                    <PackageReport embedded />
+                  </CardContent>
+                </Card>
+              </TabsContent>
+            )}
+
+            {!whatsAppEntitlementsLoading && canWhatsAppIntegration ? (
+            <TabsContent value="messages" className="space-y-6">
+              <Card className="border-0 dark:border dark:border-border shadow-sm bg-slate-50/50 dark:bg-muted/30">
+                <CardContent className="pt-6">
+                  <WhatsAppMessagesReport />
+                </CardContent>
+              </Card>
+            </TabsContent>
+            ) : null}
+          </Tabs>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ReportsTabsFallback() {
+  return <PageSkeleton variant="table" />
+}
+
+export default function ReportsPage() {
+  return (
+    <ProtectedRoute requiredModule="reports">
+      <ProtectedLayout requiredModule="reports">
+        <Suspense fallback={<ReportsTabsFallback />}>
+          <ReportsTabsBody />
+        </Suspense>
+      </ProtectedLayout>
+    </ProtectedRoute>
+  )
+}
